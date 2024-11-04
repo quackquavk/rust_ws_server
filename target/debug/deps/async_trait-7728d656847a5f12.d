@@ -1,0 +1,12 @@
+/Users/mac/Desktop/allprojects/rust_ws_server/target/debug/deps/libasync_trait-7728d656847a5f12.dylib: /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/lib.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/args.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/bound.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/expand.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/lifetime.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/parse.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/receiver.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/verbatim.rs
+
+/Users/mac/Desktop/allprojects/rust_ws_server/target/debug/deps/async_trait-7728d656847a5f12.d: /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/lib.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/args.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/bound.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/expand.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/lifetime.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/parse.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/receiver.rs /Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/verbatim.rs
+
+/Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/lib.rs:
+/Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/args.rs:
+/Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/bound.rs:
+/Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/expand.rs:
+/Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/lifetime.rs:
+/Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/parse.rs:
+/Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/receiver.rs:
+/Users/mac/.cargo/registry/src/index.crates.io-6f17d22bba15001f/async-trait-0.1.83/src/verbatim.rs:
