@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/Users/mac/Desktop/allprojects/rust_ws_server/target/debug/build/mime_guess-e50173a60977d074/out/mime_types_generated.rs
