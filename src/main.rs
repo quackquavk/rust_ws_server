@@ -39,7 +39,7 @@ async fn main() {
     // Combine routes and start server
     let routes = ws_route.with(cors);
 
-    let addr = ([0, 0, 0, 0], 8080);
+    let addr = ([127, 0, 0, 1], 8080);
     println!("WebSocket server listening on: {:?}", addr);
     
     warp::serve(routes).run(addr).await;

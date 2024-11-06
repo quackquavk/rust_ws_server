@@ -31,6 +31,7 @@ pub struct Game {
     pub black_time_ms: i64,     // Time in milliseconds
     pub last_move_timestamp: i64, // Unix timestamp in milliseconds
     pub increment_ms: i64,      // Increment in milliseconds
+    pub result: String,         // Added this field for game result
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,7 +57,11 @@ pub enum ClientMessage {
     GameOver { 
         game_id: String,
         result: String 
-    }
+    },
+    Resign { 
+        game_id: String,
+        username: String 
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,11 +78,19 @@ pub enum ServerMessage {
         black_time: i32,
         increment: i32
     },
+    Resign { 
+        game_id: String,
+        username: String 
+    },
     GameFull {
         message: String
     },
     OpponentJoined {
         username: String
+    },
+    GameResigned {
+        username: String,  // who resigned
+        winner: String    // opponent's username
     },
     MoveMade {
         from: String,
@@ -93,7 +106,23 @@ pub enum ServerMessage {
     },
     GameOver {
         result: String
-    }
+    },
+    GameCompleted {
+        game_id: String,
+        white_player: Option<String>,
+        black_player: Option<String>,
+        fen: String,
+        pgn: String,
+        moves: Vec<String>,
+        result: String,           // e.g., "1-0", "0-1", "1/2-1/2"
+        status: String,           // "completed"
+        winner: Option<String>,   // username of winner, None for draw
+        reason: String,           // e.g., "resignation", "checkmate", "stalemate", "time"
+        time_control: i32,        // initial time in seconds
+        increment: i32,           // increment in seconds
+        white_time_left: i64,     // remaining time in ms
+        black_time_left: i64,     // remaining time in ms
+    },
 }
 
 #[derive(Debug)]
@@ -209,7 +238,15 @@ pub async fn handle_connection(
                                 &db,
                                 &connections
                             ).await;
-                        }
+                        },
+                        ClientMessage::Resign { game_id, username } => {
+                            handle_resign(
+                                &game_id,
+                                &username,
+                                &db,
+                                &connections
+                            ).await;
+                        },
                     }
                 },
                 Err(e) => {
@@ -219,11 +256,11 @@ pub async fn handle_connection(
         }
     }
 
-    // Clean up on disconnect with try_lock
-    println!("Connection closed, cleaning up");
+    // Clean up only the WebSocket connection on disconnect, not the player assignment
+    println!("Connection closed, cleaning up WebSocket connection");
     if let Ok(mut conns) = connections.try_lock() {
         conns.retain(|_, conn| conn.id != connection_id);
-        println!("Cleaned up connection");
+        println!("Cleaned up WebSocket connection for ID: {}", connection_id);
     } else {
         println!("Failed to acquire lock for cleanup");
     }
@@ -242,137 +279,150 @@ async fn handle_join_game(
     println!("Starting handle_join_game for: {}", username);
     let games = db.collection::<Game>("games");
     
-    if let Ok(Some(mut game)) = games.find_one(doc! { "_id": game_id }, None).await {
-        let color = if game.white_player.as_deref() == Some(username) {
-            "white"
-        } else if game.black_player.as_deref() == Some(username) {
-            "black"
-        } else if game.white_player.is_none() {
-            game.white_player = Some(username.to_string());
-            "white"
-        } else if game.black_player.is_none() {
-            game.black_player = Some(username.to_string());
-            "black"
-        } else {
-            return; // Game is full
-        };
-
-        // Store the connection
-        let player_conn = PlayerConnection {
-            id: connection_id.to_string(),
-            game_id: game_id.to_string(),
-            username: username.to_string(),
-            color: color.to_string(),
-            sender: sender.clone(),
-        };
-        
-        // Store connection and check if both players are now connected
-        let mut both_players_connected = false;
-        {
-            println!("Storing connection for player: {}", username);
-            let mut retry_count = 0;
-            let max_retries = 5;
+    // First check if game exists
+    let existing_game = games.find_one(doc! { "_id": game_id }, None).await.ok().flatten();
+    
+    match existing_game {
+        Some(game) => {
+            // Handle existing game
+            println!("Found existing game with status: {}", game.status);
             
-            while retry_count < max_retries {
-                match connections.try_lock() {
-                    Ok(mut conns) => {
-                        conns.insert(username.to_string(), player_conn);
-                        // Check if both players are connected
-                        both_players_connected = conns.values()
-                            .filter(|conn| conn.game_id == game_id)
-                            .count() == 2;
-                        println!("Successfully stored connection. Both players connected: {}", both_players_connected);
-                        break;
-                    },
-                    Err(_) => {
-                        println!("Failed to acquire lock for connection storage, attempt {}", retry_count + 1);
-                        retry_count += 1;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            match game.status.as_str() {
+                "completed" => {
+                    send_completed_game(&game, sender).await;
+                    return;
+                },
+                "active" | "waiting" => {
+                    // Check if player is part of the game
+                    let is_white = game.white_player.as_deref() == Some(username);
+                    let is_black = game.black_player.as_deref() == Some(username);
+                    
+                    if !is_white && !is_black {
+                        // New player trying to join
+                        if game.white_player.is_some() && game.black_player.is_some() {
+                            let msg = ServerMessage::GameFull {
+                                message: "Game is already full".to_string()
+                            };
+                            sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
+                            return;
+                        }
                     }
+
+                    // Determine player's color from game data
+                    let color = if is_white {
+                        "white"
+                    } else if is_black {
+                        "black"
+                    } else if game.white_player.is_none() {
+                        "white"
+                    } else {
+                        "black"
+                    };
+
+                    // Store the connection
+                    let player_conn = PlayerConnection {
+                        id: connection_id.to_string(),
+                        game_id: game_id.to_string(),
+                        username: username.to_string(),
+                        color: color.to_string(),
+                        sender: sender.clone(),
+                    };
+
+                    // Update only connections, not player assignments
+                    {
+                        if let Ok(mut conns) = connections.try_lock() {
+                            // Remove any existing connection for this username
+                            conns.retain(|_, conn| conn.username != username);
+                            conns.insert(username.to_string(), player_conn);
+                        }
+                    }
+
+                    // Only update database for new players, not reconnections
+                    if !is_white && !is_black {
+                        let mut update = doc! {
+                            format!("{}_player", color): username,
+                            "updated_at": chrono::Utc::now().to_rfc3339()
+                        };
+
+                        // Check if this completes the game setup
+                        let both_players_assigned = match color {
+                            "white" => game.black_player.is_some(),
+                            "black" => game.white_player.is_some(),
+                            _ => false
+                        };
+
+                        if both_players_assigned && game.status == "waiting" {
+                            update.insert("status", "active");
+                            update.insert("last_move_time", chrono::Utc::now().to_rfc3339());
+                            update.insert("last_move_timestamp", current_timestamp_ms());
+                        }
+
+                        games.update_one(
+                            doc! { "_id": game_id },
+                            doc! { "$set": update },
+                            None
+                        ).await.ok();
+                    }
+
+                    // Send game state and notify opponent
+                    send_game_state(color, &game, username, sender);
+                    notify_opponent(&game, username, connections).await;
+                },
+                _ => {
+                    println!("Invalid game status: {}", game.status);
+                    return;
                 }
             }
-        }
+        },
+        None => {
+            // Handle new game creation
+            if time_control <= 0 || increment < 0 {
+                let msg = ServerMessage::Error("Invalid time controls".to_string());
+                sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
+                return;
+            }
 
-        // Update game in database
-        if color == "white" || color == "black" {
-            let mut update = doc! {
-                format!("{}_player", color): username,
-                "updated_at": chrono::Utc::now().to_rfc3339()
+            let time_control_ms = (time_control as i64) * 1000;
+            let increment_ms = (increment as i64) * 1000;
+            
+            let new_game = Game {
+                _id: game_id.to_string(),
+                white_player: Some(username.to_string()),
+                black_player: None,
+                fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
+                pgn: String::new(),
+                status: "waiting".to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                turn: "white".to_string(),
+                moves: Vec::new(),
+                white_time: time_control,
+                black_time: time_control,
+                last_move_time: chrono::Utc::now().to_rfc3339(),
+                increment,
+                white_time_ms: time_control_ms,
+                black_time_ms: time_control_ms,
+                last_move_timestamp: current_timestamp_ms(),
+                increment_ms,
+                result: String::new(),
             };
 
-            // Start the clock only when both players are connected
-            if both_players_connected {
-                update.insert("last_move_time", chrono::Utc::now().to_rfc3339());
-                update.insert("status", "active");
-                println!("Starting game clock as both players are connected");
-            }
+            // Create new game in database
+            if let Ok(_) = games.insert_one(&new_game, None).await {
+                let player_conn = PlayerConnection {
+                    id: connection_id.to_string(),
+                    game_id: game_id.to_string(),
+                    username: username.to_string(),
+                    color: "white".to_string(),
+                    sender: sender.clone(),
+                };
 
-            games.update_one(
-                doc! { "_id": game_id },
-                doc! { "$set": update },
-                None
-            ).await.ok();
-        }
-
-        send_game_state(color, &game, username, sender);
-        notify_opponent(&game, username, connections).await;
-    } else {
-        // Create new game with proper time initialization
-        let time_control_ms = (time_control as i64) * 1000; // Convert seconds to milliseconds
-        let increment_ms = (increment as i64) * 1000;       // Convert seconds to milliseconds
-        
-        let new_game = Game {
-            _id: game_id.to_string(),
-            white_player: Some(username.to_string()),
-            black_player: None,
-            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
-            pgn: String::new(),
-            status: "waiting".to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            turn: "white".to_string(),
-            moves: Vec::new(),
-            white_time: time_control,
-            black_time: time_control,
-            last_move_time: chrono::Utc::now().to_rfc3339(),
-            increment,
-            white_time_ms: time_control_ms,     // Initialize with full time
-            black_time_ms: time_control_ms,     // Initialize with full time
-            last_move_timestamp: current_timestamp_ms(),
-            increment_ms
-        };
-        
-        // Store the connection for new game
-        let player_conn = PlayerConnection {
-            id: connection_id.to_string(),
-            game_id: game_id.to_string(),
-            username: username.to_string(),
-            color: "white".to_string(),
-            sender: sender.clone(),
-        };
-        
-        println!("Storing connection for new player: {}", username);
-        // Use try_lock with timeout
-        let mut retry_count = 0;
-        let max_retries = 5;
-        
-        while retry_count < max_retries {
-            match connections.try_lock() {
-                Ok(mut conns) => {
+                if let Ok(mut conns) = connections.try_lock() {
                     conns.insert(username.to_string(), player_conn);
-                    println!("Successfully stored connection");
-                    break;
-                },
-                Err(_) => {
-                    println!("Failed to acquire lock for connection storage, attempt {}", retry_count + 1);
-                    retry_count += 1;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
-            }
-        }
 
-        if let Ok(_) = games.insert_one(&new_game, None).await {
-            send_game_state("white", &new_game, username, sender);
+                send_game_state("white", &new_game, username, sender);
+            }
         }
     }
 }
@@ -383,6 +433,7 @@ fn send_game_state(
     username: &str,
     sender: &tokio::sync::mpsc::UnboundedSender<WarpMessage>
 ) {
+    // Get opponent from game data, not from connections
     let opponent = match color {
         "white" => game.black_player.clone(),
         "black" => game.white_player.clone(),
@@ -392,7 +443,7 @@ fn send_game_state(
     let msg = ServerMessage::GameJoined {
         game_id: game._id.clone(),
         color: color.to_string(),
-        opponent,
+        opponent,  // Use database information
         fen: game.fen.clone(),
         pgn: game.pgn.clone(),
         turn: game.turn.clone(),
@@ -415,27 +466,21 @@ async fn notify_opponent(
     };
     let msg_str = serde_json::to_string(&msg).unwrap();
     
-    let mut retry_count = 0;
-    let max_retries = 5;
-    
-    while retry_count < max_retries {
-        match connections.try_lock() {
-            Ok(conns) => {
-                for conn in conns.values() {
-                    if conn.game_id == game._id && conn.username != username {
-                        conn.sender.send(WarpMessage::text(msg_str.clone())).ok();
-                    }
-                }
-                return;
-            },
-            Err(_) => {
-                println!("Failed to acquire lock for opponent notification, attempt {}", retry_count + 1);
-                retry_count += 1;
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Determine opponent from game data
+    let opponent_username = if game.white_player.as_deref() == Some(username) {
+        game.black_player.as_ref()
+    } else {
+        game.white_player.as_ref()
+    };
+
+    if let Some(opponent) = opponent_username {
+        if let Ok(conns) = connections.try_lock() {
+            // Only send notification if opponent is connected
+            if let Some(conn) = conns.get(opponent) {
+                conn.sender.send(WarpMessage::text(msg_str)).ok();
             }
         }
     }
-    println!("Failed to notify opponent after {} attempts", max_retries);
 }
 
 async fn handle_move(
@@ -603,28 +648,30 @@ async fn handle_game_over(
 ) {
     let games = db.collection::<Game>("games");
     
-    // Update game status in database
-    games.update_one(
-        doc! { "_id": game_id },
-        doc! { 
-            "$set": {
-                "status": "completed",
-                "result": &result,
-                "updated_at": chrono::Utc::now().to_string()
-            }
-        },
-        None
-    ).await.ok();
+    if let Ok(Some(game)) = games.find_one(doc! { "_id": game_id }, None).await {
+        // Update game status in database
+        games.update_one(
+            doc! { "_id": game_id },
+            doc! { 
+                "$set": {
+                    "status": "completed",
+                    "result": &result,
+                    "updated_at": chrono::Utc::now().to_rfc3339()
+                }
+            },
+            None
+        ).await.ok();
 
-    // Notify all players in the game
-    let conns = connections.lock().await;
-    for conn in conns.values() {
-        if conn.game_id == game_id {
-            // You might want to create a new ServerMessage variant for game over
-            let msg = ServerMessage::GameOver {
-                result: result.clone()
-            };
-            conn.sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
+        // Get updated game document
+        if let Ok(Some(updated_game)) = games.find_one(doc! { "_id": game_id }, None).await {
+            // Notify all players in the game
+            if let Ok(conns) = connections.try_lock() {
+                for conn in conns.values() {
+                    if conn.game_id == game_id {
+                        send_completed_game(&updated_game, &conn.sender).await;
+                    }
+                }
+            }
         }
     }
 }
@@ -667,12 +714,234 @@ async fn handle_time_sync(
     }
 }
 
+async fn handle_resign(
+    game_id: &str,
+    username: &str,
+    db: &Database,
+    connections: &Connections
+) {
+    let games = db.collection::<Game>("games");
+    
+    if let Ok(Some(game)) = games.find_one(doc! { "_id": game_id }, None).await {
+        // Determine winner (opponent of the resigning player)
+        let winner = if game.white_player.as_deref() == Some(username) {
+            game.black_player.clone()
+        } else {
+            game.white_player.clone()
+        };
+
+        let result = format!("{} resigned", username);
+        
+        // Update game in database
+        games.update_one(
+            doc! { "_id": game_id },
+            doc! { 
+                "$set": {
+                    "status": "completed",
+                    "result": &result,
+                    "updated_at": chrono::Utc::now().to_rfc3339()
+                }
+            },
+            None
+        ).await.ok();
+
+        // First send GameResigned message
+        let resign_msg = ServerMessage::GameResigned {
+            username: username.to_string(),
+            winner: winner.unwrap_or_default()
+        };
+
+        // Then get updated game and send GameCompleted
+        if let Ok(Some(updated_game)) = games.find_one(doc! { "_id": game_id }, None).await {
+            if let Ok(conns) = connections.try_lock() {
+                for conn in conns.values() {
+                    if conn.game_id == game_id {
+                        // Send both messages
+                        conn.sender.send(WarpMessage::text(
+                            serde_json::to_string(&resign_msg).unwrap()
+                        )).ok();
+                        
+                        send_completed_game(&updated_game, &conn.sender).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Helper function to get current timestamp in milliseconds
 fn current_timestamp_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+// Add this function to handle time-out
+async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
+    if game.status != "active" {
+        return;
+    }
+
+    let now = current_timestamp_ms();
+    let elapsed_ms = now - game.last_move_timestamp;
+    
+    let (white_time_remaining, black_time_remaining) = if game.turn == "white" {
+        (game.white_time_ms - elapsed_ms, game.black_time_ms)
+    } else {
+        (game.white_time_ms, game.black_time_ms - elapsed_ms)
+    };
+
+    if white_time_remaining <= 0 || black_time_remaining <= 0 {
+        let result = if white_time_remaining <= 0 {
+            "Black wins on time"
+        } else {
+            "White wins on time"
+        };
+
+        let games = db.collection::<Game>("games");
+        games.update_one(
+            doc! { "_id": &game._id },
+            doc! { 
+                "$set": {
+                    "status": "completed",
+                    "result": result,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                    "white_time_ms": white_time_remaining.max(0),
+                    "black_time_ms": black_time_remaining.max(0)
+                }
+            },
+            None
+        ).await.ok();
+
+        // Get updated game document and send to players
+        if let Ok(Some(updated_game)) = games.find_one(doc! { "_id": &game._id }, None).await {
+            if let Ok(conns) = connections.try_lock() {
+                for conn in conns.values() {
+                    if conn.game_id == game._id {
+                        send_completed_game(&updated_game, &conn.sender).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Helper function to determine winner and standardize result format
+fn get_game_result_info(result_str: &str, white_player: &Option<String>, black_player: &Option<String>) 
+    -> (String, Option<String>) { // Returns (standardized_result, winner)
+    
+    if result_str.contains("resigned") {
+        // Check who resigned
+        if let Some(username) = result_str.split_whitespace().next() {
+            let is_white_resigned = white_player.as_deref() == Some(username);
+            if is_white_resigned {
+                return ("0-1".to_string(), black_player.clone())
+            } else {
+                return ("1-0".to_string(), white_player.clone())
+            }
+        }
+    } else if result_str.contains("time") {
+        if result_str.contains("White wins") {
+            return ("1-0".to_string(), white_player.clone())
+        } else if result_str.contains("Black wins") {
+            return ("0-1".to_string(), black_player.clone())
+        }
+    } else if result_str.contains("checkmate") {
+        if result_str.contains("White wins") {
+            return ("1-0".to_string(), white_player.clone())
+        } else if result_str.contains("Black wins") {
+            return ("0-1".to_string(), black_player.clone())
+        }
+    } else if result_str.contains("stalemate") || result_str.contains("draw") {
+        return ("1/2-1/2".to_string(), None)
+    }
+    
+    ("*".to_string(), None) // Default for unknown result
+}
+
+// Add this helper function to construct a complete PGN
+fn construct_complete_pgn(
+    white_player: &Option<String>,
+    black_player: &Option<String>,
+    result: &str,
+    base_pgn: &str,
+    time_control: i32,
+    increment: i32,
+) -> String {
+    let date = chrono::Utc::now().format("%Y.%m.%d");
+    let time_control_str = format!("{}+{}", time_control, increment);
+    
+    let mut pgn = String::new();
+    
+    // Add all the standard PGN tags
+    pgn.push_str(&format!("[Event \"Casual Game\"]\n"));
+    pgn.push_str(&format!("[Site \"chessdream.vercel.app\"]\n"));
+    pgn.push_str(&format!("[Date \"{}\"]\n", date));
+    pgn.push_str(&format!("[White \"{}\"]\n", white_player.as_deref().unwrap_or("?")));
+    pgn.push_str(&format!("[Black \"{}\"]\n", black_player.as_deref().unwrap_or("?")));
+    pgn.push_str(&format!("[Result \"{}\"]\n", result));
+    pgn.push_str(&format!("[WhiteElo \"1200\"]\n"));
+    pgn.push_str(&format!("[BlackElo \"1200\"]\n"));
+    pgn.push_str(&format!("[TimeControl \"{}\"]\n", time_control_str));
+    pgn.push_str(&format!("[Variant \"Standard\"]\n"));
+    pgn.push_str("\n");  // Empty line between tags and moves
+    pgn.push_str(base_pgn);
+    pgn.push_str(&format!(" {}", result));  // Append result at the end
+
+    pgn
+}
+
+// Update send_completed_game to use the new PGN construction
+async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedSender<WarpMessage>) {
+    let (standardized_result, winner) = get_game_result_info(
+        &game.result, 
+        &game.white_player, 
+        &game.black_player
+    );
+    
+    let reason = if game.result.contains("resigned") {
+        "resignation"
+    } else if game.result.contains("time") {
+        "time"
+    } else if game.result.contains("checkmate") {
+        "checkmate"
+    } else if game.result.contains("stalemate") {
+        "stalemate"
+    } else if game.result.contains("draw") {
+        "draw"
+    } else {
+        "unknown"
+    };
+
+    // Construct complete PGN with metadata
+    let complete_pgn = construct_complete_pgn(
+        &game.white_player,
+        &game.black_player,
+        &standardized_result,
+        &game.pgn,
+        game.white_time,  // initial time control
+        game.increment
+    );
+
+    let msg = ServerMessage::GameCompleted {
+        game_id: game._id.clone(),
+        white_player: game.white_player.clone(),
+        black_player: game.black_player.clone(),
+        fen: game.fen.clone(),
+        pgn: complete_pgn,  // Use the complete PGN instead of base moves
+        moves: game.moves.clone(),
+        result: standardized_result,
+        status: game.status.clone(),
+        winner,
+        reason: reason.to_string(),
+        time_control: game.white_time,
+        increment: game.increment,
+        white_time_left: game.white_time_ms,
+        black_time_left: game.black_time_ms,
+    };
+
+    sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
 }
 
 // ... other handler functions remain similar but use MongoDB instead
