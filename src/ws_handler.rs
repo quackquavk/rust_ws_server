@@ -10,6 +10,9 @@ use warp::ws::{Message as WarpMessage, WebSocket};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use std::time::{SystemTime, UNIX_EPOCH};
+use shakmaty::{Chess, Position, Move as ChessMove, Square, Role, Color, Setup, CastlingMode, FromSetup, PositionError};
+use shakmaty::fen::Fen;
+use std::str::FromStr;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Game {
@@ -32,6 +35,7 @@ pub struct Game {
     pub last_move_timestamp: i64, // Unix timestamp in milliseconds
     pub increment_ms: i64,      // Increment in milliseconds
     pub result: String,         // Added this field for game result
+    pub draw_offered_by: Option<String>,  // Username of player who offered draw
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,6 +65,18 @@ pub enum ClientMessage {
     Resign { 
         game_id: String,
         username: String 
+    },
+    OfferDraw {
+        game_id: String,
+        username: String
+    },
+    AcceptDraw {
+        game_id: String,
+        username: String
+    },
+    DeclineDraw {
+        game_id: String,
+        username: String
     },
 }
 
@@ -97,7 +113,10 @@ pub enum ServerMessage {
         to: String,
         fen: String,
         pgn: String,
-        by_username: String
+        by_username: String,
+        turn: String,              // Added field
+        white_time_ms: i64,        // Added field
+        black_time_ms: i64         // Added field
     },
     Error(String),
     TimeUpdate {
@@ -122,6 +141,12 @@ pub enum ServerMessage {
         increment: i32,           // increment in seconds
         white_time_left: i64,     // remaining time in ms
         black_time_left: i64,     // remaining time in ms
+    },
+    DrawOffered {
+        by_username: String
+    },
+    DrawDeclined {
+        by_username: String
     },
 }
 
@@ -246,6 +271,15 @@ pub async fn handle_connection(
                                 &db,
                                 &connections
                             ).await;
+                        },
+                        ClientMessage::OfferDraw { game_id, username } => {
+                            handle_draw_offer(&game_id, &username, &db, &connections).await;
+                        },
+                        ClientMessage::AcceptDraw { game_id, username } => {
+                            handle_draw_accept(&game_id, &username, &db, &connections).await;
+                        },
+                        ClientMessage::DeclineDraw { game_id, username } => {
+                            handle_draw_decline(&game_id, &username, &db, &connections).await;
                         },
                     }
                 },
@@ -405,6 +439,7 @@ async fn handle_join_game(
                 last_move_timestamp: current_timestamp_ms(),
                 increment_ms,
                 result: String::new(),
+                draw_offered_by: None,
             };
 
             // Create new game in database
@@ -509,62 +544,100 @@ async fn handle_move(
                 return;
             }
 
-            // Calculate elapsed time with millisecond precision
-            let now = current_timestamp_ms();
-            let elapsed_ms = now - game.last_move_timestamp;
+            // Parse FEN and check game ending conditions
+            if let Ok(fen_obj) = Fen::from_str(&fen) {
+                let setup = fen_obj.into_setup();
+                if let Ok(position) = Chess::from_setup(setup, CastlingMode::Standard)
+                    .or_else(PositionError::ignore_too_much_material)
+                    .or_else(PositionError::ignore_impossible_check) 
+                {
+                    // Update game state first
+                    game.moves.push(format!("{}{}", from, to));
+                    game.fen = fen.clone();
+                    game.pgn = pgn.clone();
+                    game.turn = if game.turn == "white" { "black".to_string() } else { "white".to_string() };
+                    
+                    // Calculate and update times
+                    let now = current_timestamp_ms();
+                    let elapsed_ms = now - game.last_move_timestamp;
+                    
+                    if game.turn == "black" { // White just moved
+                        game.white_time_ms = (game.white_time_ms - elapsed_ms).max(0);
+                        if game.moves.len() > 1 {
+                            game.white_time_ms += game.increment_ms;
+                        }
+                    } else { // Black just moved
+                        game.black_time_ms = (game.black_time_ms - elapsed_ms).max(0);
+                        if game.moves.len() > 1 {
+                            game.black_time_ms += game.increment_ms;
+                        }
+                    }
+                    game.last_move_timestamp = now;
 
-            // Update times with millisecond precision
-            if game.turn == "white" {
-                game.white_time_ms = (game.white_time_ms - elapsed_ms).max(0);
-                if game.moves.len() > 1 {
-                    game.white_time_ms += game.increment_ms;
-                }
-            } else {
-                game.black_time_ms = (game.black_time_ms - elapsed_ms).max(0);
-                if game.moves.len() > 1 {
-                    game.black_time_ms += game.increment_ms;
+                    // Update game in database first
+                    games.update_one(
+                        doc! { "_id": game_id },
+                        doc! {
+                            "$set": {
+                                "moves": &game.moves,
+                                "fen": &game.fen,
+                                "pgn": &game.pgn,
+                                "turn": &game.turn,
+                                "white_time_ms": game.white_time_ms,
+                                "black_time_ms": game.black_time_ms,
+                                "last_move_timestamp": game.last_move_timestamp,
+                                "updated_at": chrono::Utc::now().to_rfc3339()
+                            }
+                        },
+                        None
+                    ).await.ok();
+
+                    // Notify players of the move
+                    let move_msg = ServerMessage::MoveMade {
+                        from: from.clone(),
+                        to: to.clone(),
+                        fen: game.fen.clone(),
+                        pgn: game.pgn.clone(),
+                        by_username: username.to_string(),
+                        turn: game.turn.clone(),
+                        white_time_ms: game.white_time_ms,
+                        black_time_ms: game.black_time_ms
+                    };
+
+                    if let Ok(conns) = connections.try_lock() {
+                        for conn in conns.values() {
+                            if conn.game_id == game_id {
+                                conn.sender.send(WarpMessage::text(
+                                    serde_json::to_string(&move_msg).unwrap()
+                                )).ok();
+                            }
+                        }
+                    }
+
+                    // Now check for game ending conditions
+                    let game_result = if position.is_checkmate() {
+                        Some(format!("{} wins by checkmate", 
+                            if game.turn == "white" { "Black" } else { "White" }))
+                    } else if position.is_stalemate() {
+                        Some("Draw by stalemate".to_string())
+                    } else if position.is_insufficient_material() {
+                        Some("Draw by insufficient material".to_string())
+                    } else {
+                        None
+                    };
+
+                    // If game is over, update status and notify players
+                    if let Some(result) = game_result {
+                        handle_game_over(game_id, result, db, connections).await;
+                        return;
+                    }
+
+                    // Check for timeout after move
+                    check_time_out(&game, db, connections).await;
                 }
             }
-
-            // Update game state
-            game.moves.push(format!("{}{}", from, to));
-            game.fen = fen.clone();
-            game.pgn = pgn.clone();
-            game.turn = if game.turn == "white" { "black".to_string() } else { "white".to_string() };
-            game.last_move_timestamp = now;
-
-            // Update in database
-            games.update_one(
-                doc! { "_id": game_id },
-                doc! { 
-                    "$set": {
-                        "fen": &game.fen,
-                        "pgn": &game.pgn,
-                        "turn": &game.turn,
-                        "moves": &game.moves,
-                        "white_time_ms": game.white_time_ms,
-                        "black_time_ms": game.black_time_ms,
-                        "last_move_timestamp": game.last_move_timestamp
-                    }
-                },
-                None
-            ).await.ok();
-
-            // Notify players with millisecond precision
-            notify_move(
-                game_id,
-                &from,
-                &to,
-                &fen,
-                &pgn,
-                username,
-                &game.white_time_ms,
-                &game.black_time_ms,
-                connections
-            ).await;
         },
-        Ok(None) => println!("Game not found: {}", game_id),
-        Err(e) => println!("Database error: {}", e)
+        _ => println!("Game not found or database error"),
     }
 }
 
@@ -586,7 +659,10 @@ async fn notify_move(
         to: to.to_string(),
         fen: fen.to_string(),
         pgn: pgn.to_string(),
-        by_username: by_username.to_string()
+        by_username: by_username.to_string(),
+        turn: "white".to_string(),
+        white_time_ms: *white_time,
+        black_time_ms: *black_time
     };
     
     let time_msg = ServerMessage::TimeUpdate {
@@ -942,6 +1018,125 @@ async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedS
     };
 
     sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
+}
+
+async fn handle_draw_offer(
+    game_id: &str,
+    username: &str,
+    db: &Database,
+    connections: &Connections
+) {
+    let games = db.collection::<Game>("games");
+    
+    if let Ok(Some(mut game)) = games.find_one(doc! { "_id": game_id }, None).await {
+        if game.status != "active" {
+            return;
+        }
+
+        // Update draw offer in database
+        games.update_one(
+            doc! { "_id": game_id },
+            doc! { 
+                "$set": {
+                    "draw_offered_by": username,
+                    "updated_at": chrono::Utc::now().to_rfc3339()
+                }
+            },
+            None
+        ).await.ok();
+
+        // Notify opponent about draw offer
+        let draw_msg = ServerMessage::DrawOffered {
+            by_username: username.to_string()
+        };
+
+        if let Ok(conns) = connections.try_lock() {
+            for conn in conns.values() {
+                if conn.game_id == game_id && conn.username != username {
+                    conn.sender.send(WarpMessage::text(
+                        serde_json::to_string(&draw_msg).unwrap()
+                    )).ok();
+                }
+            }
+        }
+    }
+}
+
+async fn handle_draw_accept(
+    game_id: &str,
+    username: &str,
+    db: &Database,
+    connections: &Connections
+) {
+    let games = db.collection::<Game>("games");
+    
+    if let Ok(Some(game)) = games.find_one(doc! { "_id": game_id }, None).await {
+        // Verify there's a pending draw offer and it's from the opponent
+        if game.draw_offered_by.as_deref() != None && 
+           game.draw_offered_by.as_deref() != Some(username) {
+            
+            // Update game as drawn
+            games.update_one(
+                doc! { "_id": game_id },
+                doc! { 
+                    "$set": {
+                        "status": "completed",
+                        "result": "Draw by agreement",
+                        "draw_offered_by": None::<Option<String>>,  // Specify the type here
+                        "updated_at": chrono::Utc::now().to_rfc3339()
+                    }
+                },
+                None
+            ).await.ok();
+
+            // Send game completion to both players
+            if let Ok(Some(updated_game)) = games.find_one(doc! { "_id": game_id }, None).await {
+                if let Ok(conns) = connections.try_lock() {
+                    for conn in conns.values() {
+                        if conn.game_id == game_id {
+                            send_completed_game(&updated_game, &conn.sender).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_draw_decline(
+    game_id: &str,
+    username: &str,
+    db: &Database,
+    connections: &Connections
+) {
+    let games = db.collection::<Game>("games");
+    
+    // Clear draw offer
+    games.update_one(
+        doc! { "_id": game_id },
+        doc! { 
+            "$set": {
+                "draw_offered_by": None::<Option<String>>,  // Specify the type here
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            }
+        },
+        None
+    ).await.ok();
+
+    // Notify opponent about declined draw
+    let decline_msg = ServerMessage::DrawDeclined {
+        by_username: username.to_string()
+    };
+
+    if let Ok(conns) = connections.try_lock() {
+        for conn in conns.values() {
+            if conn.game_id == game_id && conn.username != username {
+                conn.sender.send(WarpMessage::text(
+                    serde_json::to_string(&decline_msg).unwrap()
+                )).ok();
+            }
+        }
+    }
 }
 
 // ... other handler functions remain similar but use MongoDB instead
