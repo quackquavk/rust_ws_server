@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use shakmaty::{Chess, Position, Move as ChessMove, Square, Role, Color, Setup, CastlingMode, FromSetup, PositionError};
 use shakmaty::fen::Fen;
 use std::str::FromStr;
+use rand::Rng;
+use base32::{Alphabet, encode};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Game {
@@ -1140,3 +1142,89 @@ async fn handle_draw_decline(
 }
 
 // ... other handler functions remain similar but use MongoDB instead
+
+#[derive(Debug, Clone)]
+pub struct GameConfig {
+    pub time_control: i32,
+    pub increment: i32,
+}
+
+/// Generates a secure, unique game ID using a cryptographically secure RNG
+pub fn generate_game_id() -> String {
+    let mut rng = rand::thread_rng();
+    
+    // Generate 8 random bytes (64 bits) for better uniqueness
+    let random_bytes: Vec<u8> = (0..8)
+        .map(|_| rng.gen())
+        .collect();
+    
+    // Encode with Crockford's base32 for human-friendly IDs
+    let encoded = encode(Alphabet::Crockford, &random_bytes)
+        .to_lowercase();
+    
+    // Ensure exactly 10 characters
+    if encoded.len() >= 10 {
+        encoded[..10].to_string()
+    } else {
+        // Pad with zeros if needed (shouldn't happen with 8 bytes)
+        format!("{:0<10}", encoded)
+    }
+}
+
+/// Validates a game ID format and checks for uniqueness
+pub async fn is_valid_game_id(game_id: &str, db: &Database) -> bool {
+    let games = db.collection::<Game>("games");
+    
+    // Check format (lowercase alphanumeric, specific length)
+    if game_id.len() != 10 || !game_id.chars().all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit()
+    }) {
+        return false;
+    }
+
+    // Ensure ID doesn't exist
+    match games.find_one(doc! { "_id": game_id }, None).await {
+        Ok(Some(_)) => false,  // ID exists
+        Ok(None) => true,      // ID is available
+        Err(e) => {
+            eprintln!("Database error while validating game ID: {}", e);
+            false  // Consider invalid on database errors
+        }
+    }
+}
+
+// Add a helper function for existing game validation
+pub async fn is_existing_game_id(game_id: &str, db: &Database) -> bool {
+    let games = db.collection::<Game>("games");
+    
+    // Check format first
+    if game_id.len() != 10 || !game_id.chars().all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit()
+    }) {
+        return false;
+    }
+
+    // Check if game exists
+    match games.find_one(doc! { "_id": game_id }, None).await {
+        Ok(Some(_)) => true,   // Game exists
+        Ok(None) => false,     // Game doesn't exist
+        Err(e) => {
+            eprintln!("Database error while checking existing game: {}", e);
+            false
+        }
+    }
+}
+
+// Add constants for game configuration
+pub const MIN_TIME_CONTROL: i32 = 30;    // 30 seconds minimum
+pub const MAX_TIME_CONTROL: i32 = 7200;  // 2 hours maximum
+pub const MIN_INCREMENT: i32 = 0;        // No increment minimum
+pub const MAX_INCREMENT: i32 = 60;       // 1 minute maximum increment
+
+// Add a helper function for validating time controls
+pub fn is_valid_time_control(time_control: i32, increment: i32) -> bool {
+    time_control >= MIN_TIME_CONTROL 
+        && time_control <= MAX_TIME_CONTROL
+        && increment >= MIN_INCREMENT 
+        && increment <= MAX_INCREMENT
+}

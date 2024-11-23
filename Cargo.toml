@@ -16,3 +16,5 @@ chrono = "0.4"
 dotenv = "0.15"
 uuid = { version = "1.4", features = ["v4"] }
 shakmaty = "0.26.0"
+rand = "0.8.5"
+base32 = "0.4"
