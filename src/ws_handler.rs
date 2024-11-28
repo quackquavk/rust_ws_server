@@ -877,6 +877,23 @@ async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
             "White wins on time"
         };
 
+        // Get the standardized result format
+        let (standardized_result, _) = get_game_result_info(
+            result,
+            &game.white_player,
+            &game.black_player
+        );
+
+        // Construct complete PGN before updating database
+        let complete_pgn = construct_complete_pgn(
+            &game.white_player,
+            &game.black_player,
+            &standardized_result,
+            &game.pgn,
+            game.white_time,
+            game.increment
+        );
+
         let games = db.collection::<Game>("games");
         games.update_one(
             doc! { "_id": &game._id },
@@ -884,6 +901,7 @@ async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
                 "$set": {
                     "status": "completed",
                     "result": result,
+                    "pgn": complete_pgn,  // Save the complete PGN
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                     "white_time_ms": white_time_remaining.max(0),
                     "black_time_ms": black_time_remaining.max(0)
