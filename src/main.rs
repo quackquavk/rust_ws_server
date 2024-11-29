@@ -1,6 +1,6 @@
 use tokio;
 use warp::{Filter, ws::WebSocket, Reply};
-use mongodb::{Client, Database};
+use mongodb::{Client, Database, IndexModel, bson::doc, options::IndexOptions};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use serde_json::json;
 use serde::Deserialize;
 
 mod ws_handler;
-use ws_handler::{handle_connection, PlayerConnection, Connections, generate_game_id};
+use ws_handler::{handle_connection, PlayerConnection, Connections, generate_game_id, ChatMessage};
 
 #[derive(Debug, Deserialize)]
 struct CreateGameRequest {
@@ -28,6 +28,21 @@ async fn main() {
         .await
         .expect("Failed to connect to MongoDB");
     let db = client.database("chessdream");
+
+    // Create index for chat messages
+    db.collection::<ChatMessage>("chat_messages")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "game_id": 1,
+                    "timestamp": 1
+                })
+                .options(None)
+                .build(),
+            None
+        )
+        .await
+        .expect("Failed to create chat messages index");
 
     // Initialize shared connections state
     let connections: Connections = Arc::new(Mutex::new(HashMap::new()));

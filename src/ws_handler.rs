@@ -1,4 +1,4 @@
-use mongodb::{Client, Database, Collection, bson::{doc, Document}};
+use mongodb::{Client, Database, Collection, bson::{self, doc, Document}};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -15,6 +15,7 @@ use shakmaty::fen::Fen;
 use std::str::FromStr;
 use rand::Rng;
 use base32::{Alphabet, encode};
+use futures::TryStreamExt;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Game {
@@ -55,7 +56,8 @@ pub enum ClientMessage {
         from: String,
         to: String,
         pgn: String,
-        fen: String
+        fen: String,
+        timestamp: i64
     },
     RequestTimeSync {
         game_id: String
@@ -80,9 +82,16 @@ pub enum ClientMessage {
         game_id: String,
         username: String
     },
+    ChatMessage {
+        game_id: String,
+        username: String,
+        content: String,
+        recipient: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum ServerMessage {
     GameJoined {
         game_id: String,
@@ -150,6 +159,19 @@ pub enum ServerMessage {
     DrawDeclined {
         by_username: String
     },
+    ChatMessageReceived {
+        id: String,
+        game_id: String,
+        sender: String,
+        content: String,
+        #[serde(with = "mongodb::bson::serde_helpers::chrono_datetime_as_bson_datetime")]
+        timestamp: DateTime<Utc>,
+        is_private: bool,
+        recipient: Option<String>,
+    },
+    ChatHistory {
+        messages: Vec<ChatMessage>,
+    },
 }
 
 #[derive(Debug)]
@@ -200,7 +222,6 @@ pub async fn handle_connection(
     db: Database,
     connections: Connections
 ) {
-    println!("New WebSocket connection established");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -217,15 +238,11 @@ pub async fn handle_connection(
 
     // Handle incoming WebSocket messages
     while let Some(Ok(msg)) = ws_receiver.next().await {
-        println!("Received message: {:?}", msg);
         if let Ok(text) = msg.to_str() {
-            println!("Parsed text message: {}", text);
             match serde_json::from_str::<ClientMessage>(text) {
                 Ok(client_msg) => {
-                    println!("Successfully parsed client message: {:?}", client_msg);
                     match client_msg {
                         ClientMessage::JoinGame { game_id, username, time_control, increment } => {
-                            println!("Processing join game request: {} by {}", game_id, username);
                             handle_join_game(
                                 &game_id,
                                 &username,
@@ -237,19 +254,19 @@ pub async fn handle_connection(
                                 &connection_id
                             ).await;
                         },
-                        ClientMessage::Move { game_id, username, from, to, pgn, fen } => {
-                            println!("Before handling move - game_id: {}, username: {}", game_id, username);
+                        ClientMessage::Move { game_id, username, from, to, pgn, fen, timestamp } => {
                             handle_move(
                                 &game_id,
                                 &username,
-                                from,
-                                to,
-                                pgn,
-                                fen,
+                                &from,
+                                &to,
+                                None,
+                                &pgn,
+                                &fen,
+                                timestamp,
                                 &db,
                                 &connections
                             ).await;
-                            println!("After handling move");
                         },
                         ClientMessage::RequestTimeSync { game_id } => {
                             handle_time_sync(
@@ -283,6 +300,16 @@ pub async fn handle_connection(
                         ClientMessage::DeclineDraw { game_id, username } => {
                             handle_draw_decline(&game_id, &username, &db, &connections).await;
                         },
+                        ClientMessage::ChatMessage { game_id, username, content, recipient } => {
+                            handle_chat_message(
+                                &game_id,
+                                &username,
+                                &content,
+                                &recipient,
+                                &db,
+                                &connections
+                            ).await;
+                        },
                     }
                 },
                 Err(e) => {
@@ -293,10 +320,8 @@ pub async fn handle_connection(
     }
 
     // Clean up only the WebSocket connection on disconnect, not the player assignment
-    println!("Connection closed, cleaning up WebSocket connection");
     if let Ok(mut conns) = connections.try_lock() {
         conns.retain(|_, conn| conn.id != connection_id);
-        println!("Cleaned up WebSocket connection for ID: {}", connection_id);
     } else {
         println!("Failed to acquire lock for cleanup");
     }
@@ -312,7 +337,6 @@ async fn handle_join_game(
     connections: &Connections,
     connection_id: &str
 ) {
-    println!("Starting handle_join_game for: {}", username);
     let games = db.collection::<Game>("games");
     
     // First check if game exists
@@ -321,7 +345,6 @@ async fn handle_join_game(
     match existing_game {
         Some(game) => {
             // Handle existing game
-            println!("Found existing game with status: {}", game.status);
             
             match game.status.as_str() {
                 "completed" => {
@@ -523,123 +546,121 @@ async fn notify_opponent(
 async fn handle_move(
     game_id: &str,
     username: &str,
-    from: String,
-    to: String,
-    pgn: String,
-    fen: String,
+    from: &str,
+    to: &str,
+    promotion: Option<String>,
+    pgn: &str,
+    fen: &str,
+    timestamp: i64,
     db: &Database,
     connections: &Connections
 ) {
     let games = db.collection::<Game>("games");
     
-    match games.find_one(doc! { "_id": game_id }, None).await {
-        Ok(Some(mut game)) => {
-            if game.status != "active" {
-                return;
-            }
+    if let Ok(Some(mut game)) = games.find_one(doc! { "_id": game_id }, None).await {
+        // Return early if game is not active
+        if game.status != "active" {
+            return;
+        }
 
-            let is_white = game.white_player.as_ref().map(|s| s.as_str()) == Some(username);
-            let is_black = game.black_player.as_ref().map(|s| s.as_str()) == Some(username);
-            let is_correct_turn = (is_white && game.turn == "white") || (is_black && game.turn == "black");
-            
-            if !is_correct_turn {
-                return;
-            }
+        // Check if it's the player's turn
+        if (game.turn == "white" && game.white_player.as_deref() != Some(username)) ||
+           (game.turn == "black" && game.black_player.as_deref() != Some(username)) {
+            return;
+        }
 
-            // Parse FEN and check game ending conditions
-            if let Ok(fen_obj) = Fen::from_str(&fen) {
-                let setup = fen_obj.into_setup();
-                if let Ok(position) = Chess::from_setup(setup, CastlingMode::Standard)
-                    .or_else(PositionError::ignore_too_much_material)
-                    .or_else(PositionError::ignore_impossible_check) 
-                {
-                    // Update game state first
-                    game.moves.push(format!("{}{}", from, to));
-                    game.fen = fen.clone();
-                    game.pgn = pgn.clone();
-                    game.turn = if game.turn == "white" { "black".to_string() } else { "white".to_string() };
-                    
-                    // Calculate and update times
-                    let now = current_timestamp_ms();
-                    let elapsed_ms = now - game.last_move_timestamp;
-                    
-                    if game.turn == "black" { // White just moved
-                        game.white_time_ms = (game.white_time_ms - elapsed_ms).max(0);
-                        if game.moves.len() > 1 {
-                            game.white_time_ms += game.increment_ms;
-                        }
-                    } else { // Black just moved
-                        game.black_time_ms = (game.black_time_ms - elapsed_ms).max(0);
-                        if game.moves.len() > 1 {
-                            game.black_time_ms += game.increment_ms;
-                        }
+        // Parse FEN and check game ending conditions
+        if let Ok(fen_obj) = Fen::from_str(&fen) {
+            let setup = fen_obj.into_setup();
+            if let Ok(position) = Chess::from_setup(setup, CastlingMode::Standard)
+                .or_else(PositionError::ignore_too_much_material)
+                .or_else(PositionError::ignore_impossible_check) 
+            {
+                // Update game state first
+                game.moves.push(format!("{}{}", from, to));
+                game.fen = fen.to_string();
+                game.pgn = pgn.to_string();
+                game.turn = if game.turn == "white" { "black".to_string() } else { "white".to_string() };
+                
+                // Calculate and update times
+                let now = current_timestamp_ms();
+                let elapsed_ms = now - game.last_move_timestamp;
+                
+                if game.turn == "black" { // White just moved
+                    game.white_time_ms = (game.white_time_ms - elapsed_ms).max(0);
+                    if game.moves.len() > 1 {
+                        game.white_time_ms += game.increment_ms;
                     }
-                    game.last_move_timestamp = now;
-
-                    // Update game in database first
-                    games.update_one(
-                        doc! { "_id": game_id },
-                        doc! {
-                            "$set": {
-                                "moves": &game.moves,
-                                "fen": &game.fen,
-                                "pgn": &game.pgn,
-                                "turn": &game.turn,
-                                "white_time_ms": game.white_time_ms,
-                                "black_time_ms": game.black_time_ms,
-                                "last_move_timestamp": game.last_move_timestamp,
-                                "updated_at": chrono::Utc::now().to_rfc3339()
-                            }
-                        },
-                        None
-                    ).await.ok();
-
-                    // Notify players of the move
-                    let move_msg = ServerMessage::MoveMade {
-                        from: from.clone(),
-                        to: to.clone(),
-                        fen: game.fen.clone(),
-                        pgn: game.pgn.clone(),
-                        by_username: username.to_string(),
-                        turn: game.turn.clone(),
-                        white_time_ms: game.white_time_ms,
-                        black_time_ms: game.black_time_ms
-                    };
-
-                    if let Ok(conns) = connections.try_lock() {
-                        for conn in conns.values() {
-                            if conn.game_id == game_id {
-                                conn.sender.send(WarpMessage::text(
-                                    serde_json::to_string(&move_msg).unwrap()
-                                )).ok();
-                            }
-                        }
+                } else { // Black just moved
+                    game.black_time_ms = (game.black_time_ms - elapsed_ms).max(0);
+                    if game.moves.len() > 1 {
+                        game.black_time_ms += game.increment_ms;
                     }
-
-                    // Now check for game ending conditions
-                    let game_result = if position.is_checkmate() {
-                        Some(format!("{} wins by checkmate", 
-                            if game.turn == "white" { "Black" } else { "White" }))
-                    } else if position.is_stalemate() {
-                        Some("Draw by stalemate".to_string())
-                    } else if position.is_insufficient_material() {
-                        Some("Draw by insufficient material".to_string())
-                    } else {
-                        None
-                    };
-
-                    // If game is over, update status and notify players
-                    if let Some(result) = game_result {
-                        handle_game_over(game_id, result, db, connections).await;
-                        return;
-                    }
-
-                    // Check for timeout after move
-                    check_time_out(&game, db, connections).await;
                 }
+                game.last_move_timestamp = now;
+
+                // Update game in database first
+                games.update_one(
+                    doc! { "_id": game_id },
+                    doc! {
+                        "$set": {
+                            "moves": &game.moves,
+                            "fen": &game.fen,
+                            "pgn": &game.pgn,
+                            "turn": &game.turn,
+                            "white_time_ms": game.white_time_ms,
+                            "black_time_ms": game.black_time_ms,
+                            "last_move_timestamp": game.last_move_timestamp,
+                            "updated_at": chrono::Utc::now().to_rfc3339()
+                        }
+                    },
+                    None
+                ).await.ok();
+
+                // Notify players of the move
+                let move_msg = ServerMessage::MoveMade {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    fen: game.fen.clone(),
+                    pgn: game.pgn.clone(),
+                    by_username: username.to_string(),
+                    turn: game.turn.clone(),
+                    white_time_ms: game.white_time_ms,
+                    black_time_ms: game.black_time_ms
+                };
+
+                if let Ok(conns) = connections.try_lock() {
+                    for conn in conns.values() {
+                        if conn.game_id == game_id {
+                            conn.sender.send(WarpMessage::text(
+                                serde_json::to_string(&move_msg).unwrap()
+                            )).ok();
+                        }
+                    }
+                }
+
+                // Now check for game ending conditions
+                let game_result = if position.is_checkmate() {
+                    Some(format!("{} wins by checkmate", 
+                        if game.turn == "white" { "Black" } else { "White" }))
+                } else if position.is_stalemate() {
+                    Some("Draw by stalemate".to_string())
+                } else if position.is_insufficient_material() {
+                    Some("Draw by insufficient material".to_string())
+                } else {
+                    None
+                };
+
+                // If game is over, update status and notify players
+                if let Some(result) = game_result {
+                    handle_game_over(game_id, result, db, connections).await;
+                    return;
+                }
+
+                // Check for timeout after move
+                check_time_out(&game, db, connections).await;
             }
-        },
-        _ => println!("Game not found or database error"),
+        }
     }
 }
 
@@ -672,7 +693,6 @@ async fn notify_move(
         black_time_ms: *black_time
     };
 
-    println!("Preparing messages");
     let move_str = serde_json::to_string(&move_msg).unwrap();
     let time_str = serde_json::to_string(&time_msg).unwrap();
 
@@ -681,7 +701,6 @@ async fn notify_move(
     let max_retries = 5;
     
     while retry_count < max_retries {
-        println!("Attempting to acquire lock (attempt {})", retry_count + 1);
         
         match connections.try_lock() {
             Ok(conns) => {
@@ -704,7 +723,6 @@ async fn notify_move(
                     }
                 }
                 
-                println!("Finished notify_move for game: {}", game_id);
                 return;
             },
             Err(_) => {
@@ -857,6 +875,8 @@ fn current_timestamp_ms() -> i64 {
 
 // Add this function to handle time-out
 async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
+    println!("⏰ Checking timeout for game: {}", game._id);
+    println!("Current game status: {}", game.status);
     if game.status != "active" {
         return;
     }
@@ -869,22 +889,22 @@ async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
     } else {
         (game.white_time_ms, game.black_time_ms - elapsed_ms)
     };
-
+    println!("- Elapsed ms: {}", elapsed_ms);
     if white_time_remaining <= 0 || black_time_remaining <= 0 {
+        println!("Time out detected for game {}", game._id);
+        println!("White time: {}, Black time: {}", white_time_remaining, black_time_remaining);
         let result = if white_time_remaining <= 0 {
             "Black wins on time"
         } else {
             "White wins on time"
         };
 
-        // Get the standardized result format
-        let (standardized_result, _) = get_game_result_info(
+        let (standardized_result, winner) = get_game_result_info(
             result,
             &game.white_player,
             &game.black_player
         );
 
-        // Construct complete PGN before updating database
         let complete_pgn = construct_complete_pgn(
             &game.white_player,
             &game.black_player,
@@ -895,29 +915,51 @@ async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
         );
 
         let games = db.collection::<Game>("games");
-        games.update_one(
-            doc! { "_id": &game._id },
+        
+        // First update the game status
+        match games.find_one_and_update(
+            doc! { 
+                "_id": &game._id,
+                "status": "active"  // Only update if still active
+            },
             doc! { 
                 "$set": {
                     "status": "completed",
                     "result": result,
-                    "pgn": complete_pgn,  // Save the complete PGN
+                    "pgn": complete_pgn,
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                     "white_time_ms": white_time_remaining.max(0),
                     "black_time_ms": black_time_remaining.max(0)
                 }
             },
             None
-        ).await.ok();
-
-        // Get updated game document and send to players
-        if let Ok(Some(updated_game)) = games.find_one(doc! { "_id": &game._id }, None).await {
-            if let Ok(conns) = connections.try_lock() {
-                for conn in conns.values() {
-                    if conn.game_id == game._id {
-                        send_completed_game(&updated_game, &conn.sender).await;
+        ).await {
+            Ok(Some(updated_game)) => {
+                // Game was successfully updated, now notify clients
+                if let Ok(conns) = connections.try_lock() {
+                    for conn in conns.values() {
+                        if conn.game_id == game._id {
+                            // Send final time update
+                            let time_msg = ServerMessage::TimeUpdate {
+                                white_time_ms: white_time_remaining.max(0),
+                                black_time_ms: black_time_remaining.max(0)
+                            };
+                            conn.sender.send(WarpMessage::text(
+                                serde_json::to_string(&time_msg).unwrap()
+                            )).ok();
+                            
+                            // Send game completion
+                            send_completed_game(&updated_game, &conn.sender).await;
+                        }
                     }
                 }
+            },
+            Ok(None) => {
+                // Game was not found or was not active
+                println!("Game {} was not updated (not found or not active)", game._id);
+            },
+            Err(e) => {
+                eprintln!("Error updating game {}: {}", game._id, e);
             }
         }
     }
@@ -1245,4 +1287,115 @@ pub fn is_valid_time_control(time_control: i32, increment: i32) -> bool {
         && time_control <= MAX_TIME_CONTROL
         && increment >= MIN_INCREMENT 
         && increment <= MAX_INCREMENT
+}
+
+// Add new Message struct for database storage
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub _id: String,           // UUID for the message
+    pub game_id: String,       // Reference to the game
+    pub sender: String,        // Username of sender
+    pub content: String,       // Message content
+    #[serde(with = "mongodb::bson::serde_helpers::chrono_datetime_as_bson_datetime")]
+    pub timestamp: DateTime<Utc>, // When the message was sent
+    pub visible_to_all: bool,  // Public or private message
+    pub recipient: Option<String>, // For private messages
+}
+
+// Add the message handling function
+async fn handle_chat_message(
+    game_id: &str,
+    username: &str,
+    content: &str,
+    recipient: &Option<String>,
+    db: &Database,
+    connections: &Connections,
+) {
+    let messages = db.collection::<ChatMessage>("chat_messages");
+    let message_id = Uuid::new_v4().to_string();
+    let timestamp = Utc::now();
+    
+    // Create new message document
+    let message = ChatMessage {
+        _id: message_id.clone(),
+        game_id: game_id.to_string(),
+        sender: username.to_string(),
+        content: content.to_string(),
+        timestamp,
+        visible_to_all: recipient.is_none(),
+        recipient: recipient.clone(),
+    };
+
+    // Store message in database
+    if let Ok(_) = messages.insert_one(&message, None).await {
+        let server_message = ServerMessage::ChatMessageReceived {
+            id: message_id,
+            game_id: game_id.to_string(),
+            sender: username.to_string(),
+            content: content.to_string(),
+            timestamp,
+            is_private: recipient.is_some(),
+            recipient: recipient.clone(),
+        };
+
+        let msg_str = serde_json::to_string(&server_message).unwrap();
+
+        // Send message to appropriate recipients
+        if let Ok(conns) = connections.try_lock() {
+            for conn in conns.values() {
+                if conn.game_id == game_id {
+                    // For private messages, send only to sender and recipient
+                    if let Some(ref recipient) = recipient {
+                        if conn.username == *recipient || conn.username == username {
+                            conn.sender.send(WarpMessage::text(msg_str.clone())).ok();
+                        }
+                    } else {
+                        // Public message, send to all players in the game
+                        conn.sender.send(WarpMessage::text(msg_str.clone())).ok();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Add function to fetch chat history
+async fn fetch_chat_history(
+    game_id: &str,
+    username: &str,
+    db: &Database,
+    sender: &tokio::sync::mpsc::UnboundedSender<WarpMessage>,
+) {
+    let messages = db.collection::<ChatMessage>("chat_messages");
+    
+    // Query for messages visible to this user
+    let filter = doc! {
+        "$and": [
+            { "game_id": game_id },
+            { "$or": [
+                { "visible_to_all": true },
+                { "sender": username },
+                { "recipient": username }
+            ]}
+        ]
+    };
+    
+    if let Ok(mut cursor) = messages.find(filter, None).await {
+        let mut chat_history = Vec::new();
+        
+        while let Ok(Some(message)) = cursor.try_next().await {
+            chat_history.push(message);
+        }
+        
+        // Sort messages by timestamp
+        chat_history.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        
+        let history_msg = ServerMessage::ChatHistory {
+            messages: chat_history,
+        };
+        
+        sender.send(WarpMessage::text(
+            serde_json::to_string(&history_msg).unwrap()
+        )).ok();
+    }
 }
