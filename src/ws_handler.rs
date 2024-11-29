@@ -414,6 +414,9 @@ async fn handle_join_game(
                             update.insert("status", "active");
                             update.insert("last_move_time", chrono::Utc::now().to_rfc3339());
                             update.insert("last_move_timestamp", current_timestamp_ms());
+                            
+                            // Start the time monitor
+                            start_time_monitor(game_id.to_string(), db.clone(), connections.clone()).await;
                         }
 
                         games.update_one(
@@ -1398,4 +1401,88 @@ async fn fetch_chat_history(
             serde_json::to_string(&history_msg).unwrap()
         )).ok();
     }
+}
+
+// Add this new struct to track active games
+#[derive(Debug, Clone)]
+struct ActiveGame {
+    game_id: String,
+    last_move_timestamp: i64,
+    white_time_ms: i64,
+    black_time_ms: i64,
+    increment_ms: i64,
+    turn: String,
+}
+
+// Add this function to start the time monitor when a game becomes active
+async fn start_time_monitor(
+    game_id: String,
+    db: Database,
+    connections: Connections
+) {
+    let games = db.collection::<Game>("games");
+    
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+        
+        loop {
+            interval.tick().await;
+            
+            if let Ok(Some(game)) = games.find_one(doc! { "_id": &game_id }, None).await {
+                if game.status != "active" {
+                    break;
+                }
+                
+                let now = current_timestamp_ms();
+                let elapsed_ms = now - game.last_move_timestamp;
+                
+                let (white_time_remaining, black_time_remaining) = if game.turn == "white" {
+                    (game.white_time_ms - elapsed_ms, game.black_time_ms)
+                } else {
+                    (game.white_time_ms, game.black_time_ms - elapsed_ms)
+                };
+
+                if white_time_remaining <= 0 || black_time_remaining <= 0 {
+                    // Determine winner and result
+                    let (result, winner) = if white_time_remaining <= 0 {
+                        ("0-1", game.black_player.clone())
+                    } else {
+                        ("1-0", game.white_player.clone())
+                    };
+
+                    // Update game in database with complete information
+                    if let Ok(Some(updated_game)) = games.find_one_and_update(
+                        doc! { 
+                            "_id": &game_id,
+                            "status": "active"
+                        },
+                        doc! { 
+                            "$set": {
+                                "status": "completed",
+                                "result": &result,
+                                "winner": &winner,
+                                "reason": "timeout",
+                                "updated_at": chrono::Utc::now().to_rfc3339(),
+                                "white_time_ms": white_time_remaining.max(0),
+                                "black_time_ms": black_time_remaining.max(0)
+                            }
+                        },
+                        None
+                    ).await {
+                        // Send GameCompleted to all connected clients
+                        if let Ok(conns) = connections.try_lock() {
+                            for conn in conns.values() {
+                                if conn.game_id == game_id {
+                                    send_completed_game(&updated_game, &conn.sender).await;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    });
 }
