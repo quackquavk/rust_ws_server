@@ -39,6 +39,7 @@ pub struct Game {
     pub increment_ms: i64,      // Increment in milliseconds
     pub result: String,         // Added this field for game result
     pub draw_offered_by: Option<String>,  // Username of player who offered draw
+    pub reason: Option<String>,  // Add this field
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -222,7 +223,6 @@ pub async fn handle_connection(
     db: Database,
     connections: Connections
 ) {
-
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let connection_id = Uuid::new_v4().to_string();
@@ -253,6 +253,11 @@ pub async fn handle_connection(
                                 &connections,
                                 &connection_id
                             ).await;
+                            handle_time_sync(
+                                &game_id,
+                                &db,
+                                &connections
+                            ).await;
                         },
                         ClientMessage::Move { game_id, username, from, to, pgn, fen, timestamp } => {
                             handle_move(
@@ -264,6 +269,11 @@ pub async fn handle_connection(
                                 &pgn,
                                 &fen,
                                 timestamp,
+                                &db,
+                                &connections
+                            ).await;
+                            handle_time_sync(
+                                &game_id,
                                 &db,
                                 &connections
                             ).await;
@@ -468,6 +478,7 @@ async fn handle_join_game(
                 increment_ms,
                 result: String::new(),
                 draw_offered_by: None,
+                reason: None,
             };
 
             // Create new game in database
@@ -908,14 +919,7 @@ async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
             &game.black_player
         );
 
-        let complete_pgn = construct_complete_pgn(
-            &game.white_player,
-            &game.black_player,
-            &standardized_result,
-            &game.pgn,
-            game.white_time,
-            game.increment
-        );
+     
 
         let games = db.collection::<Game>("games");
         
@@ -929,7 +933,7 @@ async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
                 "$set": {
                     "status": "completed",
                     "result": result,
-                    "pgn": complete_pgn,
+                    "pgn": game.pgn.clone(),
                     "updated_at": chrono::Utc::now().to_rfc3339(),
                     "white_time_ms": white_time_remaining.max(0),
                     "black_time_ms": black_time_remaining.max(0)
@@ -1041,27 +1045,27 @@ async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedS
         &game.black_player
     );
     
-    let reason = if game.result.contains("resigned") {
+    // Convert to lowercase for case-insensitive comparison
+    let result_lower = game.result.to_lowercase();
+    let reason = if result_lower.contains("time") || game.reason.as_deref() == Some("timeout") {
+        "timeout"
+    } else if result_lower.contains("resigned") {
         "resignation"
-    } else if game.result.contains("time") {
-        "time"
-    } else if game.result.contains("checkmate") {
+    } else if result_lower.contains("checkmate") {
         "checkmate"
-    } else if game.result.contains("stalemate") {
+    } else if result_lower.contains("stalemate") {
         "stalemate"
-    } else if game.result.contains("draw") {
+    } else if result_lower.contains("draw") || game.reason.as_deref() == Some("Draw") {
         "draw"
     } else {
         "unknown"
     };
-
-    // Construct complete PGN with metadata
-    let complete_pgn = construct_complete_pgn(
+    let new_pgn = construct_complete_pgn(
         &game.white_player,
         &game.black_player,
         &standardized_result,
         &game.pgn,
-        game.white_time,  // initial time control
+        game.white_time,
         game.increment
     );
 
@@ -1070,7 +1074,7 @@ async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedS
         white_player: game.white_player.clone(),
         black_player: game.black_player.clone(),
         fen: game.fen.clone(),
-        pgn: complete_pgn,  // Use the complete PGN instead of base moves
+        pgn: new_pgn,
         moves: game.moves.clone(),
         result: standardized_result,
         status: game.status.clone(),

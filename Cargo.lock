@@ -206,6 +206,7 @@ dependencies = [
  "chrono",
  "dotenv",
  "futures",
+ "futures-util",
  "jsonwebtoken",
  "mongodb",
  "rand",
