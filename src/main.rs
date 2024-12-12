@@ -12,6 +12,10 @@ use std::time::Duration;
 use tokio::time::sleep;
 use std::net::{IpAddr, SocketAddr};
 use futures_util::future::join_all;
+use warp::path;
+use serde::Serialize;
+use futures_util::TryStreamExt;
+use mongodb::bson;
 
 mod ws_handler;
 use ws_handler::{handle_connection, PlayerConnection, Connections, generate_game_id, ChatMessage};
@@ -66,6 +70,12 @@ fn is_valid_time_control(time_control: i32, increment: i32) -> bool {
     // Maximum increment 60 seconds
     let valid_increment = increment >= 0 && increment <= 60;
     valid_time && valid_increment
+}
+
+#[derive(Debug, Serialize)]
+struct GameHistory {
+    games: Vec<ws_handler::Game>,
+    total: usize,
 }
 
 #[tokio::main]
@@ -127,10 +137,18 @@ async fn main() {
         .and(with_rate_limit(game_rate_limit.clone()))
         .and_then(create_game);
 
+    let get_player_games = warp::path!("api" / "games" / String)
+        .and(warp::get())
+        .and(with_db(db.clone()))
+        .and(warp::addr::remote())
+        .and(with_rate_limit(game_rate_limit.clone()))
+        .and_then(get_games_by_player);
+
     // Combine routes and start server
     let routes = ws_route
         .boxed()
         .or(create_game.boxed())
+        .or(get_player_games.boxed())
         .with(cors);
 
     let addr = ([127, 0, 0, 1], 8080);
@@ -177,7 +195,7 @@ async fn create_game(
         return Err(warp::reject::custom(RateLimitError));
     }
 
-    if !is_valid_time_control(request.time_control, request.increment) {
+    if !ws_handler::is_valid_time_control(request.time_control, request.increment) {
         return Ok(warp::reply::with_status(
             warp::reply::json(&json!({
                 "status": "error",
@@ -187,7 +205,7 @@ async fn create_game(
         ));
     }
 
-    let game_id = generate_game_id();
+    let game_id = ws_handler::generate_game_id();
     
     let games = db.collection::<ws_handler::Game>("games");
     if games.find_one(doc! { "_id": &game_id }, None).await.unwrap().is_some() {
@@ -245,6 +263,68 @@ async fn create_game(
             })),
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
         ))
+    }
+}
+
+async fn get_games_by_player(
+    username: String,
+    db: Database,
+    addr: Option<SocketAddr>,
+    rate_limit: RateLimit,
+) -> Result<impl Reply, Rejection> {
+    let ip = addr.map(|a| a.ip()).ok_or_else(warp::reject::not_found)?;
+    
+    if !rate_limit.check(ip).await {
+        return Err(warp::reject::custom(RateLimitError));
+    }
+
+    let games = db.collection::<ws_handler::Game>("games");
+    
+    let filter = doc! {
+        "$or": [
+            { "white_player": &username },
+            { "black_player": &username }
+        ]
+    };
+
+    println!("Searching for games with username: {}", username);
+
+    match games.find(filter, None).await {
+        Ok(cursor) => {
+            match cursor.try_collect::<Vec<ws_handler::Game>>().await {
+                Ok(games_list) => {
+                    println!("Found {} games", games_list.len());
+                    let total = games_list.len();
+                    Ok(warp::reply::with_status(
+                        warp::reply::json(&GameHistory {
+                            games: games_list,
+                            total,
+                        }),
+                        warp::http::StatusCode::OK,
+                    ))
+                },
+                Err(e) => {
+                    println!("Error collecting games: {:?}", e);
+                    Ok(warp::reply::with_status(
+                        warp::reply::json(&json!({
+                            "status": "error",
+                            "message": format!("Failed to collect games: {}", e)
+                        })),
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ))
+                }
+            }
+        },
+        Err(e) => {
+            println!("Error finding games: {:?}", e);
+            Ok(warp::reply::with_status(
+                warp::reply::json(&json!({
+                    "status": "error",
+                    "message": format!("Failed to query games: {}", e)
+                })),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
     }
 }
 

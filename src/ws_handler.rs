@@ -94,6 +94,9 @@ pub enum ClientMessage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    GameNotFound{
+        message: String
+    },
     GameJoined {
         game_id: String,
         color: String,
@@ -348,7 +351,7 @@ async fn handle_join_game(
     connection_id: &str
 ) {
     let games = db.collection::<Game>("games");
-    
+   
     // First check if game exists
     let existing_game = games.find_one(doc! { "_id": game_id }, None).await.ok().flatten();
     
