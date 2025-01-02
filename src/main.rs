@@ -16,6 +16,7 @@ use warp::path;
 use serde::Serialize;
 use futures_util::TryStreamExt;
 use mongodb::bson;
+use warp::http::HeaderMap;
 
 mod ws_handler;
 use ws_handler::{handle_connection, PlayerConnection, Connections, generate_game_id, ChatMessage};
@@ -61,6 +62,16 @@ impl RateLimit {
         timestamps.push(now);
         true
     }
+
+    async fn cleanup(&self) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut requests = self.requests.lock().await;
+        
+        requests.retain(|_, timestamps| {
+            timestamps.retain(|&t| now - t < self.window_ms);
+            !timestamps.is_empty()
+        });
+    }
 }
 
 // Add security validation for time control
@@ -76,6 +87,14 @@ fn is_valid_time_control(time_control: i32, increment: i32) -> bool {
 struct GameHistory {
     games: Vec<ws_handler::Game>,
     total: usize,
+}
+
+fn validate_username(username: &str) -> bool {
+    let username_length = username.chars().count();
+    // Only allow alphanumeric characters and underscores, length between 3-30
+    username_length >= 3 
+        && username_length <= 30 
+        && username.chars().all(|c| c.is_alphanumeric() || c == '-')
 }
 
 #[tokio::main]
@@ -114,10 +133,14 @@ async fn main() {
 
     // Create secure CORS configuration
     let cors = warp::cors()
-        .allow_origins(vec!["http://localhost:3000", "https://your-production-domain.com"])
-        .allow_headers(vec!["content-type"])
+        .allow_origins(vec![
+            "http://localhost:3000",  // Only for development
+            "https://your-production-domain.com"  // Strict production domain
+        ])
+        .allow_headers(vec!["content-type", "authorization"])
         .allow_methods(vec!["GET", "POST", "OPTIONS"])
-        .max_age(Duration::from_secs(3600));
+        .allow_credentials(true)
+        .build();
 
     // Add rate limiting to routes
     let ws_route = warp::path("ws")
@@ -128,33 +151,72 @@ async fn main() {
         .and(with_rate_limit(ws_rate_limit.clone()))
         .and_then(ws_handler);
 
-    let create_game = warp::path("api")
-        .and(warp::path("create-game"))
-        .and(warp::post())
-        .and(warp::body::json())
-        .and(with_db(db.clone()))
-        .and(warp::addr::remote())
-        .and(with_rate_limit(game_rate_limit.clone()))
-        .and_then(create_game);
+    let create_game = with_timeout(
+        warp::path("api")
+            .and(warp::path("create-game"))
+            .and(warp::post())
+            .and(warp::body::json())
+            .and(with_db(db.clone()))
+            .and(warp::addr::remote())
+            .and(with_rate_limit(game_rate_limit.clone()))
+            .and_then(create_game)
+    );
 
-    let get_player_games = warp::path!("api" / "games" / String)
-        .and(warp::get())
-        .and(with_db(db.clone()))
-        .and(warp::addr::remote())
-        .and(with_rate_limit(game_rate_limit.clone()))
-        .and_then(get_games_by_player);
+    let get_player_games = with_timeout(
+        warp::path!("api" / "games" / String)
+            .and(warp::get())
+            .and(with_db(db.clone()))
+            .and(warp::addr::remote())
+            .and(with_rate_limit(game_rate_limit.clone()))
+            .and_then(get_games_by_player)
+    );
+
+    // Add security headers middleware
+    let mut security_headers = HeaderMap::new();
+    security_headers.insert(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains".parse().unwrap()
+    );
+    security_headers.insert(
+        "X-Frame-Options",
+        "DENY".parse().unwrap()
+    );
+    security_headers.insert(
+        "X-Content-Type-Options",
+        "nosniff".parse().unwrap()
+    );
+    security_headers.insert(
+        "X-XSS-Protection",
+        "1; mode=block".parse().unwrap()
+    );
+    security_headers.insert(
+        "Content-Security-Policy",
+        "default-src 'self'".parse().unwrap()
+    );
+
+    let security_headers = warp::reply::with::headers(security_headers);
 
     // Combine routes and start server
     let routes = ws_route
         .boxed()
         .or(create_game.boxed())
         .or(get_player_games.boxed())
-        .with(cors);
+        .with(cors)
+        .with(security_headers);
 
     let addr = ([127, 0, 0, 1], 8080);
     println!("Server listening on: {:?}", addr);
     
     warp::serve(routes).run(addr).await;
+
+    // In main(), add periodic cleanup
+    let rate_limit_clone = game_rate_limit.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(300)).await;  // Clean every 5 minutes
+            rate_limit_clone.cleanup().await;
+        }
+    });
 }
 
 // Helper functions remain the same
@@ -278,6 +340,16 @@ async fn get_games_by_player(
         return Err(warp::reject::custom(RateLimitError));
     }
 
+    if !validate_username(&username) {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&json!({
+                "status": "error",
+                "message": "Invalid username format"
+            })),
+            warp::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
     let games = db.collection::<ws_handler::Game>("games");
     
     let filter = doc! {
@@ -339,3 +411,21 @@ fn with_rate_limit(
 #[derive(Debug)]
 struct RateLimitError;
 impl warp::reject::Reject for RateLimitError {}
+
+// Add a custom timeout wrapper for each handler
+fn with_timeout<T: Reply + Send>(
+    route: impl Filter<Extract = (T,), Error = Rejection> + Clone + Send + Sync + 'static,
+) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+    route.and_then(|reply| async move {
+        let timeout_duration = Duration::from_secs(30);
+        match tokio::time::timeout(timeout_duration, async move { Ok(reply) }).await {
+            Ok(result) => result,
+            Err(_) => Err(warp::reject::custom(TimeoutError)),
+        }
+    })
+}
+
+// Add this error type with your other error types
+#[derive(Debug)]
+struct TimeoutError;
+impl warp::reject::Reject for TimeoutError {}

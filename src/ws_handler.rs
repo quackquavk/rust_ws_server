@@ -151,7 +151,7 @@ pub enum ServerMessage {
         result: String,           // e.g., "1-0", "0-1", "1/2-1/2"
         status: String,           // "completed"
         winner: Option<String>,   // username of winner, None for draw
-        reason: String,           // e.g., "resignation", "checkmate", "stalemate", "time"
+        reason: String,           // e.g., "resignation", "checkmate", "stalemate", "time", "abandonment"
         time_control: i32,        // initial time in seconds
         increment: i32,           // increment in seconds
         white_time_left: i64,     // remaining time in ms
@@ -221,6 +221,18 @@ async fn verify_session(access_token: &str, db: &Database) -> Option<String> {
     user.get_str("username").ok().map(String::from)
 }
 
+// At the top of the file, add this new enum for game completion reasons
+#[derive(Debug)]
+pub enum GameEndReason {
+    Abandonment(String),  // String contains the username who abandoned
+    Timeout(String),      // String contains the player who ran out of time
+    Resignation(String),  // String contains the player who resigned
+    Checkmate,
+    Stalemate,
+    Draw,
+}
+
+// Update handle_connection function
 pub async fn handle_connection(
     ws_stream: WebSocket,
     db: Database,
@@ -229,8 +241,9 @@ pub async fn handle_connection(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let connection_id = Uuid::new_v4().to_string();
+    let mut player_info: Option<(String, String)> = None; // (game_id, username)
 
-    // Spawn a task to handle outgoing messages
+    // Spawn task for sending messages
     tokio::spawn(async move {
         while let Some(msg) = receiver.recv().await {
             if ws_sender.send(msg).await.is_err() {
@@ -243,100 +256,186 @@ pub async fn handle_connection(
     while let Some(Ok(msg)) = ws_receiver.next().await {
         if let Ok(text) = msg.to_str() {
             match serde_json::from_str::<ClientMessage>(text) {
-                Ok(client_msg) => {
-                    match client_msg {
-                        ClientMessage::JoinGame { game_id, username, time_control, increment } => {
-                            handle_join_game(
-                                &game_id,
-                                &username,
-                                &sender,
-                                time_control,
-                                increment,
-                                &db,
-                                &connections,
-                                &connection_id
-                            ).await;
-                            handle_time_sync(
-                                &game_id,
-                                &db,
-                                &connections
-                            ).await;
-                        },
-                        ClientMessage::Move { game_id, username, from, to, pgn, fen, timestamp } => {
-                            handle_move(
-                                &game_id,
-                                &username,
-                                &from,
-                                &to,
-                                None,
-                                &pgn,
-                                &fen,
-                                timestamp,
-                                &db,
-                                &connections
-                            ).await;
-                            handle_time_sync(
-                                &game_id,
-                                &db,
-                                &connections
-                            ).await;
-                        },
-                        ClientMessage::RequestTimeSync { game_id } => {
-                            handle_time_sync(
-                                &game_id,
-                                &db,
-                                &connections
-                            ).await;
-                        },
-                        ClientMessage::GameOver { game_id, result } => {
-                            handle_game_over(
-                                &game_id,
-                                result,
-                                &db,
-                                &connections
-                            ).await;
-                        },
-                        ClientMessage::Resign { game_id, username } => {
-                            handle_resign(
-                                &game_id,
-                                &username,
-                                &db,
-                                &connections
-                            ).await;
-                        },
-                        ClientMessage::OfferDraw { game_id, username } => {
-                            handle_draw_offer(&game_id, &username, &db, &connections).await;
-                        },
-                        ClientMessage::AcceptDraw { game_id, username } => {
-                            handle_draw_accept(&game_id, &username, &db, &connections).await;
-                        },
-                        ClientMessage::DeclineDraw { game_id, username } => {
-                            handle_draw_decline(&game_id, &username, &db, &connections).await;
-                        },
-                        ClientMessage::ChatMessage { game_id, username, content, recipient } => {
-                            handle_chat_message(
-                                &game_id,
-                                &username,
-                                &content,
-                                &recipient,
-                                &db,
-                                &connections
-                            ).await;
-                        },
-                    }
+                Ok(ClientMessage::JoinGame { game_id, username, time_control, increment }) => {
+                    player_info = Some((game_id.clone(), username.clone()));
+                    handle_join_game(
+                        &game_id,
+                        &username,
+                        &sender,
+                        time_control,
+                        increment,
+                        &db,
+                        &connections,
+                        &connection_id
+                    ).await;
+                    handle_time_sync(
+                        &game_id,
+                        &db,
+                        &connections
+                    ).await;
                 },
-                Err(e) => {
-                    println!("Failed to parse client message: {}", e); // Better error logging
-                }
+                Ok(ClientMessage::Move { game_id, username, from, to, pgn, fen, timestamp }) => {
+                    handle_move(
+                        &game_id,
+                        &username,
+                        &from,
+                        &to,
+                        None,
+                        &pgn,
+                        &fen,
+                        timestamp,
+                        &db,
+                        &connections
+                    ).await;
+                    handle_time_sync(
+                        &game_id,
+                        &db,
+                        &connections
+                    ).await;
+                },
+                Ok(ClientMessage::RequestTimeSync { game_id }) => {
+                    handle_time_sync(
+                        &game_id,
+                        &db,
+                        &connections
+                    ).await;
+                },
+                Ok(ClientMessage::GameOver { game_id, result }) => {
+                    handle_game_over(
+                        &game_id,
+                        result,
+                        &db,
+                        &connections
+                    ).await;
+                },
+                Ok(ClientMessage::Resign { game_id, username }) => {
+                    handle_resign(
+                        &game_id,
+                        &username,
+                        &db,
+                        &connections
+                    ).await;
+                },
+                Ok(ClientMessage::OfferDraw { game_id, username }) => {
+                    handle_draw_offer(&game_id, &username, &db, &connections).await;
+                },
+                Ok(ClientMessage::AcceptDraw { game_id, username }) => {
+                    handle_draw_accept(&game_id, &username, &db, &connections).await;
+                },
+                Ok(ClientMessage::DeclineDraw { game_id, username }) => {
+                    handle_draw_decline(&game_id, &username, &db, &connections).await;
+                },
+                Ok(ClientMessage::ChatMessage { game_id, username, content, recipient }) => {
+                    handle_chat_message(
+                        &game_id,
+                        &username,
+                        &content,
+                        &recipient,
+                        &db,
+                        &connections
+                    ).await;
+                },
+                Err(e) => println!("Failed to parse client message: {}", e)
             }
         }
     }
 
-    // Clean up only the WebSocket connection on disconnect, not the player assignment
+    // Handle disconnection
+    if let Some((game_id, username)) = player_info {
+        handle_player_disconnection(&game_id, &username, &db, &connections).await;
+    }
+
+    // Clean up connection
     if let Ok(mut conns) = connections.try_lock() {
         conns.retain(|_, conn| conn.id != connection_id);
-    } else {
-        println!("Failed to acquire lock for cleanup");
+    }
+}
+
+// Add this new function to handle player disconnection
+async fn handle_player_disconnection(
+    game_id: &str,
+    username: &str,
+    db: &Database,
+    connections: &Connections
+) {
+    println!("🔌 Player disconnection detected - Game: {}, User: {}", game_id, username);
+    
+    let games = db.collection::<Game>("games");
+    
+    // First check if game is still active
+    match games.find_one(doc! { 
+        "_id": game_id,
+        "status": "active"
+    }, None).await {
+        Ok(Some(game)) => {
+            println!("📊 Found active game: {}", game_id);
+            
+            // Determine winner (opponent of disconnected player)
+            let (winner, result) = if game.white_player.as_deref() == Some(username) {
+                println!("⚪ White player disconnected, Black wins");
+                (game.black_player.clone(), "0-1")
+            } else {
+                println!("⚫ Black player disconnected, White wins");
+                (game.white_player.clone(), "1-0")
+            };
+
+            println!("🏆 Winner determined: {:?}", winner);
+
+            // Create abandonment message
+            let result_message = format!("{} abandoned", username);
+            println!("📝 Result message: {}", result_message);
+
+            // Update game status with winner information
+            let update_doc = doc! { 
+                "$set": {
+                    "status": "completed",
+                    "result": &result_message,
+                    "reason": "abandonment",
+                    "winner": &winner,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }
+            };
+
+            // First update the document
+            match games.update_one(
+                doc! { 
+                    "_id": game_id,
+                    "status": "active"  // Only update if still active
+                },
+                update_doc.clone(),
+                None
+            ).await {
+                Ok(update_result) => {
+                    if update_result.modified_count > 0 {
+                        // If document was updated, fetch the updated document
+                        if let Ok(Some(updated_game)) = games.find_one(
+                            doc! { "_id": game_id }, 
+                            None
+                        ).await {
+                            println!("✅ Game updated successfully");
+                            println!("📊 Updated game status: {}", updated_game.status);
+                            println!("📝 Updated result: {}", updated_game.result);
+                            println!("🏆 Updated winner: {:?}", winner);
+                            
+                            // Notify remaining players with the updated game state
+                            if let Ok(conns) = connections.try_lock() {
+                                for conn in conns.values() {
+                                    if conn.game_id == game_id {
+                                        println!("📨 Sending game completion to player: {}", conn.username);
+                                        send_completed_game(&updated_game, &conn.sender).await;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        println!("❌ Game was not modified (possibly already completed)");
+                    }
+                },
+                Err(e) => println!("❌ Error updating game: {}", e),
+            }
+        },
+        Ok(None) => println!("❌ No active game found with ID: {}", game_id),
+        Err(e) => println!("❌ Error finding game: {}", e),
     }
 }
 
@@ -353,12 +452,9 @@ async fn handle_join_game(
     let games = db.collection::<Game>("games");
    
     // First check if game exists
-    let existing_game = games.find_one(doc! { "_id": game_id }, None).await.ok().flatten();
-    
-    match existing_game {
-        Some(game) => {
-            // Handle existing game
-            
+    match games.find_one(doc! { "_id": game_id }, None).await {
+        Ok(Some(game)) => {
+            // Game exists - continue with existing logic...
             match game.status.as_str() {
                 "completed" => {
                     send_completed_game(&game, sender).await;
@@ -445,61 +541,34 @@ async fn handle_join_game(
                 },
                 _ => {
                     println!("Invalid game status: {}", game.status);
+                    let msg = ServerMessage::GameNotFound {
+                        message: "Invalid game status".to_string()
+                    };
+                    sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
                     return;
                 }
             }
         },
-        None => {
-            // Handle new game creation
+        Ok(None) => {
+            // Game doesn't exist
             if time_control <= 0 || increment < 0 {
                 let msg = ServerMessage::Error("Invalid time controls".to_string());
                 sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
                 return;
             }
 
-            let time_control_ms = (time_control as i64) * 1000;
-            let increment_ms = (increment as i64) * 1000;
-            
-            let new_game = Game {
-                _id: game_id.to_string(),
-                white_player: Some(username.to_string()),
-                black_player: None,
-                fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
-                pgn: String::new(),
-                status: "waiting".to_string(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                updated_at: chrono::Utc::now().to_rfc3339(),
-                turn: "white".to_string(),
-                moves: Vec::new(),
-                white_time: time_control,
-                black_time: time_control,
-                last_move_time: chrono::Utc::now().to_rfc3339(),
-                increment,
-                white_time_ms: time_control_ms,
-                black_time_ms: time_control_ms,
-                last_move_timestamp: current_timestamp_ms(),
-                increment_ms,
-                result: String::new(),
-                draw_offered_by: None,
-                reason: None,
+            let msg = ServerMessage::GameNotFound {
+                message: format!("Game {} not found", game_id)
             };
-
-            // Create new game in database
-            if let Ok(_) = games.insert_one(&new_game, None).await {
-                let player_conn = PlayerConnection {
-                    id: connection_id.to_string(),
-                    game_id: game_id.to_string(),
-                    username: username.to_string(),
-                    color: "white".to_string(),
-                    sender: sender.clone(),
-                };
-
-                if let Ok(mut conns) = connections.try_lock() {
-                    conns.insert(username.to_string(), player_conn);
-                }
-
-                send_game_state("white", &new_game, username, sender);
-            }
+            sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
+            return;
+        },
+        Err(e) => {
+            // Database error
+            println!("Database error while looking up game: {}", e);
+            let msg = ServerMessage::Error("Internal server error".to_string());
+            sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
+            return;
         }
     }
 }
@@ -979,7 +1048,17 @@ async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
 fn get_game_result_info(result_str: &str, white_player: &Option<String>, black_player: &Option<String>) 
     -> (String, Option<String>) { // Returns (standardized_result, winner)
     
-    if result_str.contains("resigned") {
+    if result_str.contains("abandoned") {
+        // Check who abandoned
+        if let Some(username) = result_str.split_whitespace().next() {
+            let is_white_abandoned = white_player.as_deref() == Some(username);
+            if is_white_abandoned {
+                return ("0-1".to_string(), black_player.clone())
+            } else {
+                return ("1-0".to_string(), white_player.clone())
+            }
+        }
+    } else if result_str.contains("resigned") {
         // Check who resigned
         if let Some(username) = result_str.split_whitespace().next() {
             let is_white_resigned = white_player.as_deref() == Some(username);
@@ -1003,6 +1082,10 @@ fn get_game_result_info(result_str: &str, white_player: &Option<String>, black_p
         }
     } else if result_str.contains("stalemate") || result_str.contains("draw") {
         return ("1/2-1/2".to_string(), None)
+    } else if result_str == "1-0" {
+        return ("1-0".to_string(), white_player.clone())
+    } else if result_str == "0-1" {
+        return ("0-1".to_string(), black_player.clone())
     }
     
     ("*".to_string(), None) // Default for unknown result
@@ -1042,12 +1125,22 @@ fn construct_complete_pgn(
 
 // Update send_completed_game to use the new PGN construction
 async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedSender<WarpMessage>) {
+    println!("🎮 Preparing game completion message");
+    println!("📊 Game state before processing:");
+    println!("   Status: {}", game.status);
+    println!("   Result: {}", game.result);
+    println!("   Reason: {:?}", game.reason);
+
     let (standardized_result, winner) = get_game_result_info(
         &game.result, 
         &game.white_player, 
         &game.black_player
     );
     
+    println!("🎯 After get_game_result_info:");
+    println!("   Standardized Result: {}", standardized_result);
+    println!("   Winner: {:?}", winner);
+
     // Convert to lowercase for case-insensitive comparison
     let result_lower = game.result.to_lowercase();
     let reason = if result_lower.contains("time") || game.reason.as_deref() == Some("timeout") {
@@ -1060,9 +1153,16 @@ async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedS
         "stalemate"
     } else if result_lower.contains("draw") || game.reason.as_deref() == Some("Draw") {
         "draw"
+    } else if result_lower.contains("abandonment") || result_lower.contains("abandoned") {
+        println!("🚫 Detected abandonment");
+        "abandonment"
     } else {
+        println!("❓ Unknown game end reason");
         "unknown"
     };
+
+    println!("📋 Final reason determined: {}", reason);
+
     let new_pgn = construct_complete_pgn(
         &game.white_player,
         &game.black_player,
@@ -1089,7 +1189,17 @@ async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedS
         black_time_left: game.black_time_ms,
     };
 
-    sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
+    println!("📤 Sending final game completion message");
+    if let Ok(msg_str) = serde_json::to_string(&msg) {
+        println!("📦 Message content: {}", msg_str);
+        if let Err(e) = sender.send(WarpMessage::text(msg_str)) {
+            println!("❌ Error sending message: {}", e);
+        } else {
+            println!("✅ Message sent successfully");
+        }
+    } else {
+        println!("❌ Error serializing message");
+    }
 }
 
 async fn handle_draw_offer(
