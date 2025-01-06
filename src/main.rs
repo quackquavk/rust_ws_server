@@ -134,12 +134,26 @@ async fn main() {
     // Create secure CORS configuration
     let cors = warp::cors()
         .allow_origins(vec![
-            "http://localhost:3000",  // Only for development
-            "https://your-production-domain.com"  // Strict production domain
+            "http://localhost:3000",
+            "https://chessdream.vercel.app",
+            "https://www.chessdream.vercel.app"
         ])
-        .allow_headers(vec!["content-type", "authorization"])
+        .allow_headers(vec![
+            "content-type",
+            "authorization",
+            "sec-websocket-protocol",
+            "sec-websocket-version",
+            "sec-websocket-key",
+            "sec-websocket-extensions",
+            "upgrade",
+            "connection",
+            "origin",
+            "pragma",
+            "cache-control"
+        ])
         .allow_methods(vec!["GET", "POST", "OPTIONS"])
         .allow_credentials(true)
+        .max_age(3600)
         .build();
 
     // Add rate limiting to routes
@@ -149,7 +163,19 @@ async fn main() {
         .and(with_connections(connections.clone()))
         .and(warp::addr::remote())
         .and(with_rate_limit(ws_rate_limit.clone()))
-        .and_then(ws_handler);
+        .and(warp::header::headers_cloned())
+        .map(|ws: warp::ws::Ws, 
+             db: Database, 
+             connections: Connections, 
+             addr: Option<SocketAddr>, 
+             rate_limit: RateLimit,
+             headers: HeaderMap| {
+            // Configure WebSocket with available options
+            let reply = ws.max_send_queue(1024)
+               .max_message_size(1024 * 1024); // 1MB limit
+
+            reply.on_upgrade(move |socket| handle_connection(socket, db, connections))
+        });
 
     let create_game = with_timeout(
         warp::path("api")
@@ -179,7 +205,7 @@ async fn main() {
     );
     security_headers.insert(
         "X-Frame-Options",
-        "DENY".parse().unwrap()
+        "SAMEORIGIN".parse().unwrap()
     );
     security_headers.insert(
         "X-Content-Type-Options",
@@ -191,7 +217,7 @@ async fn main() {
     );
     security_headers.insert(
         "Content-Security-Policy",
-        "default-src 'self'".parse().unwrap()
+        "default-src 'self'; connect-src 'self' ws: wss:;".parse().unwrap()
     );
 
     let security_headers = warp::reply::with::headers(security_headers);

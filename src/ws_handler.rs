@@ -16,6 +16,7 @@ use std::str::FromStr;
 use rand::Rng;
 use base32::{Alphabet, encode};
 use futures::TryStreamExt;
+use lazy_static::lazy_static;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Game {
@@ -232,126 +233,175 @@ pub enum GameEndReason {
     Draw,
 }
 
+// Add this at the top with other structs
+#[derive(Debug, Clone)]
+struct DisconnectionInfo {
+    username: String,
+    game_id: String,
+    disconnect_time: i64,
+    reconnect_window: i64, // milliseconds
+}
+
+// Add this as a static/global variable
+lazy_static::lazy_static! {
+    static ref DISCONNECTED_PLAYERS: Arc<Mutex<HashMap<String, DisconnectionInfo>>> = 
+        Arc::new(Mutex::new(HashMap::new()));
+}
+
 // Update handle_connection function
 pub async fn handle_connection(
     ws_stream: WebSocket,
     db: Database,
     connections: Connections
 ) {
+    println!("🔌 New WebSocket connection attempt");
+    
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let connection_id = Uuid::new_v4().to_string();
-    let mut player_info: Option<(String, String)> = None; // (game_id, username)
+    let mut player_info: Option<(String, String)> = None;
+
+    // Send initial handshake message
+    let handshake_msg = ServerMessage::Error("connection_established".to_string());
+    if let Ok(msg_str) = serde_json::to_string(&handshake_msg) {
+        println!("📤 Sending initial handshake message");
+        match ws_sender.send(WarpMessage::text(msg_str)).await {
+            Ok(_) => println!("✅ Handshake message sent successfully"),
+            Err(e) => println!("❌ Failed to send handshake message: {}", e),
+        }
+    }
 
     // Spawn task for sending messages
-    tokio::spawn(async move {
+    let ws_sender_task = tokio::spawn(async move {
         while let Some(msg) = receiver.recv().await {
-            if ws_sender.send(msg).await.is_err() {
-                break;
+            match ws_sender.send(msg).await {
+                Ok(_) => println!("📤 Message sent successfully"),
+                Err(e) => {
+                    println!("❌ Failed to send message: {}", e);
+                    break;
+                }
             }
         }
+        println!("📤 Sender task completed");
     });
 
     // Handle incoming WebSocket messages
-    while let Some(Ok(msg)) = ws_receiver.next().await {
-        if let Ok(text) = msg.to_str() {
-            match serde_json::from_str::<ClientMessage>(text) {
-                Ok(ClientMessage::JoinGame { game_id, username, time_control, increment }) => {
-                    player_info = Some((game_id.clone(), username.clone()));
-                    handle_join_game(
-                        &game_id,
-                        &username,
-                        &sender,
-                        time_control,
-                        increment,
-                        &db,
-                        &connections,
-                        &connection_id
-                    ).await;
-                    handle_time_sync(
-                        &game_id,
-                        &db,
-                        &connections
-                    ).await;
-                },
-                Ok(ClientMessage::Move { game_id, username, from, to, pgn, fen, timestamp }) => {
-                    handle_move(
-                        &game_id,
-                        &username,
-                        &from,
-                        &to,
-                        None,
-                        &pgn,
-                        &fen,
-                        timestamp,
-                        &db,
-                        &connections
-                    ).await;
-                    handle_time_sync(
-                        &game_id,
-                        &db,
-                        &connections
-                    ).await;
-                },
-                Ok(ClientMessage::RequestTimeSync { game_id }) => {
-                    handle_time_sync(
-                        &game_id,
-                        &db,
-                        &connections
-                    ).await;
-                },
-                Ok(ClientMessage::GameOver { game_id, result }) => {
-                    handle_game_over(
-                        &game_id,
-                        result,
-                        &db,
-                        &connections
-                    ).await;
-                },
-                Ok(ClientMessage::Resign { game_id, username }) => {
-                    handle_resign(
-                        &game_id,
-                        &username,
-                        &db,
-                        &connections
-                    ).await;
-                },
-                Ok(ClientMessage::OfferDraw { game_id, username }) => {
-                    handle_draw_offer(&game_id, &username, &db, &connections).await;
-                },
-                Ok(ClientMessage::AcceptDraw { game_id, username }) => {
-                    handle_draw_accept(&game_id, &username, &db, &connections).await;
-                },
-                Ok(ClientMessage::DeclineDraw { game_id, username }) => {
-                    handle_draw_decline(&game_id, &username, &db, &connections).await;
-                },
-                Ok(ClientMessage::ChatMessage { game_id, username, content, recipient }) => {
-                    handle_chat_message(
-                        &game_id,
-                        &username,
-                        &content,
-                        &recipient,
-                        &db,
-                        &connections
-                    ).await;
-                },
-                Err(e) => println!("Failed to parse client message: {}", e)
+    while let Some(result) = ws_receiver.next().await {
+        match result {
+            Ok(msg) => {
+                if let Ok(text) = msg.to_str() {
+                    println!("📥 Received message: {}", text);
+                    match serde_json::from_str::<ClientMessage>(text) {
+                        Ok(ClientMessage::JoinGame { game_id, username, time_control, increment }) => {
+                            println!("👤 Join game request from {}", username);
+                            player_info = Some((game_id.clone(), username.clone()));
+                            handle_join_game(
+                                &game_id,
+                                &username,
+                                &sender,
+                                time_control,
+                                increment,
+                                &db,
+                                &connections,
+                                &connection_id
+                            ).await;
+                            handle_time_sync(
+                                &game_id,
+                                &db,
+                                &connections
+                            ).await;
+                        },
+                        Ok(ClientMessage::Move { game_id, username, from, to, pgn, fen, timestamp }) => {
+                            handle_move(
+                                &game_id,
+                                &username,
+                                &from,
+                                &to,
+                                None,
+                                &pgn,
+                                &fen,
+                                timestamp,
+                                &db,
+                                &connections
+                            ).await;
+                            handle_time_sync(
+                                &game_id,
+                                &db,
+                                &connections
+                            ).await;
+                        },
+                        Ok(ClientMessage::RequestTimeSync { game_id }) => {
+                            handle_time_sync(
+                                &game_id,
+                                &db,
+                                &connections
+                            ).await;
+                        },
+                        Ok(ClientMessage::GameOver { game_id, result }) => {
+                            handle_game_over(
+                                &game_id,
+                                result,
+                                &db,
+                                &connections
+                            ).await;
+                        },
+                        Ok(ClientMessage::Resign { game_id, username }) => {
+                            handle_resign(
+                                &game_id,
+                                &username,
+                                &db,
+                                &connections
+                            ).await;
+                        },
+                        Ok(ClientMessage::OfferDraw { game_id, username }) => {
+                            handle_draw_offer(&game_id, &username, &db, &connections).await;
+                        },
+                        Ok(ClientMessage::AcceptDraw { game_id, username }) => {
+                            handle_draw_accept(&game_id, &username, &db, &connections).await;
+                        },
+                        Ok(ClientMessage::DeclineDraw { game_id, username }) => {
+                            handle_draw_decline(&game_id, &username, &db, &connections).await;
+                        },
+                        Ok(ClientMessage::ChatMessage { game_id, username, content, recipient }) => {
+                            handle_chat_message(
+                                &game_id,
+                                &username,
+                                &content,
+                                &recipient,
+                                &db,
+                                &connections
+                            ).await;
+                        },
+                        Err(e) => println!("❌ Failed to parse client message: {}", e)
+                    }
+                }
+            },
+            Err(e) => {
+                println!("❌ WebSocket error: {}", e);
+                break;
             }
         }
     }
 
     // Handle disconnection
+    println!("🔌 Connection closing");
     if let Some((game_id, username)) = player_info {
+        println!("👋 Player {} disconnected from game {}", username, game_id);
         handle_player_disconnection(&game_id, &username, &db, &connections).await;
     }
 
     // Clean up connection
     if let Ok(mut conns) = connections.try_lock() {
         conns.retain(|_, conn| conn.id != connection_id);
+        println!("🧹 Cleaned up connection {}", connection_id);
     }
+
+    // Ensure sender task is terminated
+    ws_sender_task.abort();
+    println!("🛑 Connection handler completed");
 }
 
-// Add this new function to handle player disconnection
+// Update handle_player_disconnection function
 async fn handle_player_disconnection(
     game_id: &str,
     username: &str,
@@ -360,6 +410,67 @@ async fn handle_player_disconnection(
 ) {
     println!("🔌 Player disconnection detected - Game: {}, User: {}", game_id, username);
     
+    // Check if player is already in disconnected state
+    let should_handle = {
+        let mut disconnected = DISCONNECTED_PLAYERS.lock().await;
+        if !disconnected.contains_key(username) {
+            // Add player to disconnected list with 15 second window
+            disconnected.insert(username.to_string(), DisconnectionInfo {
+                username: username.to_string(),
+                game_id: game_id.to_string(),
+                disconnect_time: current_timestamp_ms(),
+                reconnect_window: 15000, // 15 seconds in milliseconds
+            });
+            
+            // Spawn a task to handle abandonment after timeout
+            let username = username.to_string();
+            let game_id = game_id.to_string();
+            let db = db.clone();
+            let connections = connections.clone();
+            
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                
+                // Check if player has reconnected
+                let should_abandon = {
+                    let mut disconnected = DISCONNECTED_PLAYERS.lock().await;
+                    match disconnected.get(&username) {
+                        Some(info) if info.game_id == game_id => {
+                            // Only remove and abandon if this is the same disconnection instance
+                            disconnected.remove(&username);
+                            true
+                        }
+                        Some(_) => false,  // Different game, don't abandon
+                        None => false,     // Already reconnected
+                    }
+                };
+
+                if should_abandon {
+                    println!("⏰ Abandonment timer expired for player {} in game {}", username, game_id);
+                    handle_abandonment(&game_id, &username, &db, &connections).await;
+                } else {
+                    println!("✅ Player {} reconnected or playing different game", username);
+                }
+            });
+            
+            false // Don't handle abandonment immediately
+        } else {
+            false // Player already in disconnected state
+        }
+    };
+
+    if should_handle {
+        handle_abandonment(game_id, username, db, connections).await;
+    }
+}
+
+// Add this new function to handle the actual abandonment
+async fn handle_abandonment(
+    game_id: &str,
+    username: &str,
+    db: &Database,
+    connections: &Connections
+) {
     let games = db.collection::<Game>("games");
     
     // First check if game is still active
@@ -368,11 +479,8 @@ async fn handle_player_disconnection(
         "status": "active"
     }, None).await {
         Ok(Some(game)) => {
-            println!("📊 Found active game: {}", game_id);
-            
             // Determine winner (opponent of disconnected player)
             let (winner, result) = if game.white_player.as_deref() == Some(username) {
-                println!("⚪ White player disconnected, Black wins");
                 (game.black_player.clone(), "0-1")
             } else {
                 println!("⚫ Black player disconnected, White wins");
@@ -383,7 +491,6 @@ async fn handle_player_disconnection(
 
             // Create abandonment message
             let result_message = format!("{} abandoned", username);
-            println!("📝 Result message: {}", result_message);
 
             // Update game status with winner information
             let update_doc = doc! { 
@@ -396,28 +503,21 @@ async fn handle_player_disconnection(
                 }
             };
 
-            // First update the document
+            // Update the document
             match games.update_one(
                 doc! { 
                     "_id": game_id,
-                    "status": "active"  // Only update if still active
+                    "status": "active"
                 },
                 update_doc.clone(),
                 None
             ).await {
                 Ok(update_result) => {
                     if update_result.modified_count > 0 {
-                        // If document was updated, fetch the updated document
                         if let Ok(Some(updated_game)) = games.find_one(
                             doc! { "_id": game_id }, 
                             None
                         ).await {
-                            println!("✅ Game updated successfully");
-                            println!("📊 Updated game status: {}", updated_game.status);
-                            println!("📝 Updated result: {}", updated_game.result);
-                            println!("🏆 Updated winner: {:?}", winner);
-                            
-                            // Notify remaining players with the updated game state
                             if let Ok(conns) = connections.try_lock() {
                                 for conn in conns.values() {
                                     if conn.game_id == game_id {
@@ -427,8 +527,6 @@ async fn handle_player_disconnection(
                                 }
                             }
                         }
-                    } else {
-                        println!("❌ Game was not modified (possibly already completed)");
                     }
                 },
                 Err(e) => println!("❌ Error updating game: {}", e),
@@ -449,6 +547,18 @@ async fn handle_join_game(
     connections: &Connections,
     connection_id: &str
 ) {
+    println!("👋 Player {} attempting to join game {}", username, game_id);
+    
+    // First check if this is a reconnection
+    {
+        let mut disconnected = DISCONNECTED_PLAYERS.lock().await;
+        if let Some(info) = disconnected.get(username) {
+            if info.game_id == game_id {
+                disconnected.remove(username);  // Remove from disconnected list
+            }
+        }
+    }
+
     let games = db.collection::<Game>("games");
    
     // First check if game exists
@@ -564,8 +674,6 @@ async fn handle_join_game(
             return;
         },
         Err(e) => {
-            // Database error
-            println!("Database error while looking up game: {}", e);
             let msg = ServerMessage::Error("Internal server error".to_string());
             sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
             return;
@@ -761,7 +869,6 @@ async fn notify_move(
     black_time: &i64,
     connections: &Connections
 ) {
-    println!("Starting notify_move for game: {}", game_id);
     
     let move_msg = ServerMessage::MoveMade {
         from: from.to_string(),
@@ -975,10 +1082,8 @@ async fn check_time_out(game: &Game, db: &Database, connections: &Connections) {
     } else {
         (game.white_time_ms, game.black_time_ms - elapsed_ms)
     };
-    println!("- Elapsed ms: {}", elapsed_ms);
     if white_time_remaining <= 0 || black_time_remaining <= 0 {
         println!("Time out detected for game {}", game._id);
-        println!("White time: {}, Black time: {}", white_time_remaining, black_time_remaining);
         let result = if white_time_remaining <= 0 {
             "Black wins on time"
         } else {
@@ -1154,14 +1259,12 @@ async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedS
     } else if result_lower.contains("draw") || game.reason.as_deref() == Some("Draw") {
         "draw"
     } else if result_lower.contains("abandonment") || result_lower.contains("abandoned") {
-        println!("🚫 Detected abandonment");
         "abandonment"
     } else {
         println!("❓ Unknown game end reason");
         "unknown"
     };
 
-    println!("📋 Final reason determined: {}", reason);
 
     let new_pgn = construct_complete_pgn(
         &game.white_player,
@@ -1189,16 +1292,8 @@ async fn send_completed_game(game: &Game, sender: &tokio::sync::mpsc::UnboundedS
         black_time_left: game.black_time_ms,
     };
 
-    println!("📤 Sending final game completion message");
     if let Ok(msg_str) = serde_json::to_string(&msg) {
-        println!("📦 Message content: {}", msg_str);
-        if let Err(e) = sender.send(WarpMessage::text(msg_str)) {
-            println!("❌ Error sending message: {}", e);
-        } else {
-            println!("✅ Message sent successfully");
-        }
-    } else {
-        println!("❌ Error serializing message");
+        sender.send(WarpMessage::text(msg_str)).ok();
     }
 }
 
@@ -1321,7 +1416,6 @@ async fn handle_draw_decline(
     }
 }
 
-// ... other handler functions remain similar but use MongoDB instead
 
 #[derive(Debug, Clone)]
 pub struct GameConfig {
@@ -1430,7 +1524,7 @@ async fn handle_chat_message(
     recipient: &Option<String>,
     db: &Database,
     connections: &Connections,
-) {
+   ) {
     let messages = db.collection::<ChatMessage>("chat_messages");
     let message_id = Uuid::new_v4().to_string();
     let timestamp = Utc::now();
