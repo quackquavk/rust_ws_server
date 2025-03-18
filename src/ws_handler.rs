@@ -254,21 +254,28 @@ pub async fn handle_connection(
     db: Database,
     connections: Connections
 ) {
-    println!("🔌 New WebSocket connection attempt");
+    
+    // Better connection logging
     
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let connection_id = Uuid::new_v4().to_string();
     let mut player_info: Option<(String, String)> = None;
 
-    // Send initial handshake message
+    // Send initial handshake message with more detailed error handling
     let handshake_msg = ServerMessage::Error("connection_established".to_string());
     if let Ok(msg_str) = serde_json::to_string(&handshake_msg) {
-        println!("📤 Sending initial handshake message");
         match ws_sender.send(WarpMessage::text(msg_str)).await {
-            Ok(_) => println!("✅ Handshake message sent successfully"),
-            Err(e) => println!("❌ Failed to send handshake message: {}", e),
+            Ok(_)=> {
+                println!("🤝 Handshake message sent successfully");
+            },
+            Err(e) => {
+                println!("🔍 Error details: {:?}", e);
+            }
         }
+    } else {
+        println!("❌ Failed to serialize handshake message");
     }
 
     // Spawn task for sending messages
@@ -277,12 +284,10 @@ pub async fn handle_connection(
             match ws_sender.send(msg).await {
                 Ok(_) => println!("📤 Message sent successfully"),
                 Err(e) => {
-                    println!("❌ Failed to send message: {}", e);
                     break;
                 }
             }
         }
-        println!("📤 Sender task completed");
     });
 
     // Handle incoming WebSocket messages
@@ -377,14 +382,12 @@ pub async fn handle_connection(
                 }
             },
             Err(e) => {
-                println!("❌ WebSocket error: {}", e);
                 break;
             }
         }
     }
 
     // Handle disconnection
-    println!("🔌 Connection closing");
     if let Some((game_id, username)) = player_info {
         println!("👋 Player {} disconnected from game {}", username, game_id);
         handle_player_disconnection(&game_id, &username, &db, &connections).await;
@@ -554,6 +557,7 @@ async fn handle_join_game(
         let mut disconnected = DISCONNECTED_PLAYERS.lock().await;
         if let Some(info) = disconnected.get(username) {
             if info.game_id == game_id {
+                println!("🔄 Player {} reconnecting to game {}", username, game_id);
                 disconnected.remove(username);  // Remove from disconnected list
             }
         }
@@ -564,119 +568,133 @@ async fn handle_join_game(
     // First check if game exists
     match games.find_one(doc! { "_id": game_id }, None).await {
         Ok(Some(game)) => {
-            // Game exists - continue with existing logic...
+            println!("🎮 Found game: {:?}", game);  // Debug log
+            
             match game.status.as_str() {
                 "completed" => {
+                    println!("❌ Game {} is already completed", game_id);
                     send_completed_game(&game, sender).await;
                     return;
                 },
                 "active" | "waiting" => {
-                    // Check if player is part of the game
+                    // Check if player is already in the game
                     let is_white = game.white_player.as_deref() == Some(username);
                     let is_black = game.black_player.as_deref() == Some(username);
                     
-                    if !is_white && !is_black {
-                        // New player trying to join
-                        if game.white_player.is_some() && game.black_player.is_some() {
+                    if game.status == "active" && !is_white && !is_black {
+                        println!("🚫 Rejecting join attempt: Game {} is active and player {} is not a participant", game_id, username);
+                        let msg = ServerMessage::GameFull {
+                            message: "This game is already in progress".to_string()
+                        };
+                        sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
+                        return;
+                    }
+
+                    // Handle joining for waiting game
+                    if game.status == "waiting" {
+                        let (color, opponent) = if game.white_player.is_none() {
+                            ("white", game.black_player.clone())
+                        } else if game.black_player.is_none() {
+                            ("black", game.white_player.clone())
+                        } else {
+                            println!("🚫 Game is full");
                             let msg = ServerMessage::GameFull {
                                 message: "Game is already full".to_string()
                             };
                             sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
                             return;
+                        };
+
+                        // Update game with new player
+                        let update = match color {
+                            "white" => doc! { 
+                                "$set": {
+                                    "white_player": username,
+                                    "status": if game.black_player.is_some() { "active" } else { "waiting" },
+                                    "updated_at": chrono::Utc::now().to_rfc3339()
+                                }
+                            },
+                            "black" => doc! { 
+                                "$set": {
+                                    "black_player": username,
+                                    "status": if game.white_player.is_some() { "active" } else { "waiting" },
+                                    "updated_at": chrono::Utc::now().to_rfc3339()
+                                }
+                            },
+                            _ => unreachable!()
+                        };
+
+                        if let Ok(_) = games.update_one(doc! { "_id": game_id }, update, None).await {
+                            // Store the connection
+                            let player_conn = PlayerConnection {
+                                id: connection_id.to_string(),
+                                game_id: game_id.to_string(),
+                                username: username.to_string(),
+                                color: color.to_string(),
+                                sender: sender.clone(),
+                            };
+
+                            if let Ok(mut conns) = connections.try_lock() {
+                                conns.insert(username.to_string(), player_conn);
+                            }
+
+                            // Get updated game state
+                            if let Ok(Some(updated_game)) = games.find_one(doc! { "_id": game_id }, None).await {
+                                send_game_state(color, &updated_game, username, sender);
+                                notify_opponent(&updated_game, username, connections).await;
+
+                                // If this was the second player joining (game becomes active)
+                                if updated_game.status == "active" {
+                                    // Start the game timer after a delay
+                                    let game_id = game_id.to_string();
+                                    let db = db.clone();
+                                    let connections = connections.clone();
+                                    tokio::spawn(async move {
+                                        start_game_timer(&game_id, &db, &connections).await;
+                                    });
+                                }
+                            }
                         }
-                    }
-
-                    // Determine player's color from game data
-                    let color = if is_white {
-                        "white"
-                    } else if is_black {
-                        "black"
-                    } else if game.white_player.is_none() {
-                        "white"
                     } else {
-                        "black"
-                    };
+                        // Reconnection to active game
+                        let color = if is_white { "white" } else { "black" };
+                        
+                        // Store the connection
+                        let player_conn = PlayerConnection {
+                            id: connection_id.to_string(),
+                            game_id: game_id.to_string(),
+                            username: username.to_string(),
+                            color: color.to_string(),
+                            sender: sender.clone(),
+                        };
 
-                    // Store the connection
-                    let player_conn = PlayerConnection {
-                        id: connection_id.to_string(),
-                        game_id: game_id.to_string(),
-                        username: username.to_string(),
-                        color: color.to_string(),
-                        sender: sender.clone(),
-                    };
-
-                    // Update only connections, not player assignments
-                    {
                         if let Ok(mut conns) = connections.try_lock() {
-                            // Remove any existing connection for this username
-                            conns.retain(|_, conn| conn.username != username);
                             conns.insert(username.to_string(), player_conn);
                         }
+
+                        send_game_state(color, &game, username, sender);
                     }
-
-                    // Only update database for new players, not reconnections
-                    if !is_white && !is_black {
-                        let mut update = doc! {
-                            format!("{}_player", color): username,
-                            "updated_at": chrono::Utc::now().to_rfc3339()
-                        };
-
-                        // Check if this completes the game setup
-                        let both_players_assigned = match color {
-                            "white" => game.black_player.is_some(),
-                            "black" => game.white_player.is_some(),
-                            _ => false
-                        };
-
-                        if both_players_assigned && game.status == "waiting" {
-                            update.insert("status", "active");
-                            update.insert("last_move_time", chrono::Utc::now().to_rfc3339());
-                            update.insert("last_move_timestamp", current_timestamp_ms());
-                            
-                            // Start the time monitor
-                            start_time_monitor(game_id.to_string(), db.clone(), connections.clone()).await;
-                        }
-
-                        games.update_one(
-                            doc! { "_id": game_id },
-                            doc! { "$set": update },
-                            None
-                        ).await.ok();
-                    }
-
-                    // Send game state and notify opponent
-                    send_game_state(color, &game, username, sender);
-                    notify_opponent(&game, username, connections).await;
                 },
                 _ => {
-                    println!("Invalid game status: {}", game.status);
+                    println!("❌ Invalid game status: {}", game.status);
                     let msg = ServerMessage::GameNotFound {
                         message: "Invalid game status".to_string()
                     };
                     sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
-                    return;
                 }
             }
         },
         Ok(None) => {
-            // Game doesn't exist
-            if time_control <= 0 || increment < 0 {
-                let msg = ServerMessage::Error("Invalid time controls".to_string());
-                sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
-                return;
-            }
-
+            println!("❌ Game {} not found", game_id);
             let msg = ServerMessage::GameNotFound {
                 message: format!("Game {} not found", game_id)
             };
             sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
-            return;
         },
         Err(e) => {
+            println!("❌ Database error: {}", e);
             let msg = ServerMessage::Error("Internal server error".to_string());
             sender.send(WarpMessage::text(serde_json::to_string(&msg).unwrap())).ok();
-            return;
         }
     }
 }
@@ -973,7 +991,8 @@ async fn handle_time_sync(
     let games = db.collection::<Game>("games");
     
     if let Ok(Some(game)) = games.find_one(doc! { "_id": game_id }, None).await {
-        if game.status != "active" {
+        // Only update times if game is active and has both players
+        if game.status != "active" || game.white_player.is_none() || game.black_player.is_none() {
             return;
         }
 
@@ -1696,4 +1715,43 @@ async fn start_time_monitor(
             }
         }
     });
+}
+
+// First, let's add a new helper function to start the game timer
+async fn start_game_timer(game_id: &str, db: &Database, connections: &Connections) {
+    // Wait 2 seconds before starting the timer
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    
+    let games = db.collection::<Game>("games");
+    
+    // Set the initial timestamp when the game actually starts
+    if let Ok(Some(mut game)) = games.find_one(doc! { "_id": game_id }, None).await {
+        let now = chrono::Utc::now().timestamp_millis();
+        
+        // Update the game with fresh timestamps
+        let update = doc! {
+            "$set": {
+                "last_move_timestamp": now,
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            }
+        };
+        
+        if let Ok(_) = games.update_one(doc! { "_id": game_id }, update, None).await {
+            // Notify players that the game is starting
+            let time_msg = ServerMessage::TimeUpdate {
+                white_time_ms: game.white_time_ms,
+                black_time_ms: game.black_time_ms
+            };
+
+            if let Ok(conns) = connections.try_lock() {
+                for conn in conns.values() {
+                    if conn.game_id == game_id {
+                        conn.sender.send(WarpMessage::text(
+                            serde_json::to_string(&time_msg).unwrap()
+                        )).ok();
+                    }
+                }
+            }
+        }
+    }
 }

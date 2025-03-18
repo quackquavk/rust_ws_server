@@ -133,27 +133,12 @@ async fn main() {
 
     // Create secure CORS configuration
     let cors = warp::cors()
-        .allow_origins(vec![
-            "http://localhost:3000",
-            "https://chessdream.vercel.app",
-            "https://www.chessdream.vercel.app"
-        ])
+        .allow_any_origin()
         .allow_headers(vec![
-            "content-type",
-            "authorization",
-            "sec-websocket-protocol",
-            "sec-websocket-version",
-            "sec-websocket-key",
-            "sec-websocket-extensions",
-            "upgrade",
-            "connection",
-            "origin",
-            "pragma",
-            "cache-control"
+           "Content-Type"
         ])
         .allow_methods(vec!["GET", "POST", "OPTIONS"])
         .allow_credentials(true)
-        .max_age(3600)
         .build();
 
     // Add rate limiting to routes
@@ -197,41 +182,14 @@ async fn main() {
             .and_then(get_games_by_player)
     );
 
-    // Add security headers middleware
-    let mut security_headers = HeaderMap::new();
-    security_headers.insert(
-        "Strict-Transport-Security",
-        "max-age=31536000; includeSubDomains".parse().unwrap()
-    );
-    security_headers.insert(
-        "X-Frame-Options",
-        "SAMEORIGIN".parse().unwrap()
-    );
-    security_headers.insert(
-        "X-Content-Type-Options",
-        "nosniff".parse().unwrap()
-    );
-    security_headers.insert(
-        "X-XSS-Protection",
-        "1; mode=block".parse().unwrap()
-    );
-    security_headers.insert(
-        "Content-Security-Policy",
-        "default-src 'self'; connect-src 'self' ws: wss:;".parse().unwrap()
-    );
-
-    let security_headers = warp::reply::with::headers(security_headers);
-
     // Combine routes and start server
     let routes = ws_route
         .boxed()
         .or(create_game.boxed())
         .or(get_player_games.boxed())
-        .with(cors)
-        .with(security_headers);
+        .with(cors);
 
-    let addr = ([127, 0, 0, 1], 8080);
-    println!("Server listening on: {:?}", addr);
+    let addr = ([0, 0, 0, 0], 8080);
     
     warp::serve(routes).run(addr).await;
 
@@ -385,13 +343,11 @@ async fn get_games_by_player(
         ]
     };
 
-    println!("Searching for games with username: {}", username);
 
     match games.find(filter, None).await {
         Ok(cursor) => {
             match cursor.try_collect::<Vec<ws_handler::Game>>().await {
                 Ok(games_list) => {
-                    println!("Found {} games", games_list.len());
                     let total = games_list.len();
                     Ok(warp::reply::with_status(
                         warp::reply::json(&GameHistory {
@@ -402,7 +358,6 @@ async fn get_games_by_player(
                     ))
                 },
                 Err(e) => {
-                    println!("Error collecting games: {:?}", e);
                     Ok(warp::reply::with_status(
                         warp::reply::json(&json!({
                             "status": "error",
@@ -414,7 +369,6 @@ async fn get_games_by_player(
             }
         },
         Err(e) => {
-            println!("Error finding games: {:?}", e);
             Ok(warp::reply::with_status(
                 warp::reply::json(&json!({
                     "status": "error",
